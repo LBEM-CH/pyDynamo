@@ -9,6 +9,7 @@ jobs:
     # GitHub-hosted runners have no GPU: GPU tests (marker "gpu") are skipped here and run locally on the cluster.
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false            # report every Python version, even when one fails
       matrix:
         python-version: ["3.11", "3.12"]
     steps:

@@ -293,7 +293,8 @@ def test_inplace_dynamoproject_initialize_writes_nothing(tmp_path, monkeypatch):
     dvunfold("p")
     root = str(tmp_path / "p")
     listing = sorted(os.listdir(root))
-    pr = DynamoProject(root, str(tmp_path / "filamentsData_ctf"), root, echo=False)
+    # initialize only: no engine runs, so the fast one (which needs no Dynamo installation, e.g. in CI)
+    pr = DynamoProject(root, str(tmp_path / "filamentsData_ctf"), root, echo=False, engine="fast")
     pr.initialize()
     assert sorted(os.listdir(root)) == listing      # no log.txt, no temp/, nothing copied
     os.remove(os.path.join(root, "next_iteration.txt"))
