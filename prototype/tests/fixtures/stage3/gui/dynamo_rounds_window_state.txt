@@ -1,0 +1,15 @@
+checkbox_functionality_general 1
+checkbox_functionality_angles 1
+checkbox_functionality_plugin 0
+checkbox_functionality_convergence 0
+checkbox_functionality_threshold 1
+checkbox_functionality_classification 0
+checkbox_functionality_limits 1
+checkbox_functionality_correlation 1
+checkbox_functionality_system 0
+checkbox_advanced 0
+togglebutton_round 1
+checkbox_funcionality_bandpass 0
+checkbox_family_invisible missing
+togglebutton_round_string show general parameters
+columns round 1|round 2|round 3|round 4|round 5|round 6|round 7|round 8

@@ -1,0 +1,17 @@
+pyDynamo re-implements algorithms of Dynamo (https://www.dynamo-em.org) in Python/CUDA. The GPU rotation
+kernel, the orientation-set generator and the averaging and wedge conventions are ports of Dynamo's
+implementation, made to reproduce its results. Dynamo itself is not included in this repository.
+Dynamo is distributed under the following notice:
+
+  Copyright (c) 2012 Daniel Castano and Henning Stahlberg
+  Center for Cellular Imaging and Nano Analytics
+  Biocenter, University of Basel
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  The Software is provided "as is", without warranty of any kind.

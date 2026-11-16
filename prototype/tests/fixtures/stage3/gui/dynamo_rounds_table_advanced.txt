@@ -1,0 +1,33 @@
+ite|iterations| 2| 2| 0| 0| 0| 0| 0| 0
+nref|references| 1| 1| 1| 1| 1| 1| 1| 1
+cone_range|cone aperture| 20| 20| 20| 20| 360| 360| 360| 360
+cone_sampling|cone sampling| 3| 3| 3| 3| 45| 45| 45| 45
+cone_flip|cone flip| 0| 0| 0| 0| 0| 0| 0| 0
+cone_check_peak|check orientation peak| 0| 0| 0| 0| 0| 0| 0| 0
+cone_freeze_reference|freeze reference| 0| 0| 0| 0| 0| 0| 0| 0
+inplane_range|azymuth rotation range| 360| 45| 90| 45| 360| 360| 360| 360
+inplane_sampling|azymuth rotation sampling| 15| 5| 15| 5| 45| 45| 45| 45
+inplane_flip|azymuth flip| 0| 0| 0| 0| 0| 0| 0| 0
+inplane_check_peak|check azymuth peak| 0| 0| 0| 0| 0| 0| 0| 0
+inplane_freeze_reference|freeze azymuth reference| 0| 0| 0| 0| 0| 0| 0| 0
+refine|refine| 2| 2| 2| 2| 5| 5| 5| 5
+refine_factor|refine factor| 2| 2| 2| 2| 2| 2| 2| 2
+high|high pass| 2| 2| 2| 2| 2| 2| 2| 2
+low|low| 25| 25| 25| 25| 32| 32| 32| 32
+sym|symmetry|c1|c1|c1|c1|c1|c1|c1|c1
+dim|Particle dimensions.| 64| 64| 64| 64| 0| 0| 0| 0
+area_search|shift limits| 4 4 2| 4 4 2| 4 4 2| 4 4 2| 4 4 4| 4 4 4| 4 4 4| 4 4 4
+area_search_modus|shift limiting way| 4| 4| 4| 4| 0| 0| 0| 0
+separation_in_tomogram|separation in tomogram| 0| 0| 0| 0| 0| 0| 0| 0
+limit_xy_check_peak|check peak in xy shift| 0| 0| 0| 0| 0| 0| 0| 0
+limit_z_check_peak|check peak in z shift| 0| 0| 0| 0| 0| 0| 0| 0
+use_CC|fourier constraints| 1| 1| 1| 1| 1| 1| 1| 1
+localnc|normalized cross correlation| 1| 1| 1| 1| 1| 1| 1| 1
+mra|basic MRA| 0| 0| 0| 0| 0| 0| 0| 0
+threshold|threshold parameter|  0.20|  0.20|  0.20|  0.20|  0.20|  0.20|  0.20|  0.20
+threshold_modus|treshold modus| 0| 0| 0| 0| 0| 0| 0| 0
+threshold2|second threshold parameter|  0.20|  0.20|  0.20|  0.20|  0.20|  0.20|  0.20|  0.20
+threshold2_modus|second threshold modus| 0| 0| 0| 0| 0| 0| 0| 0
+rings|rings| 0| 0| 0| 0| 0| 0| 0| 0
+rings_random|rings_random| 0| 0| 0| 0| 0| 0| 0| 0
+dynamic_mask|dynamic_mask| 0| 0| 0| 0| 0| 0| 0| 0

@@ -1,0 +1,7 @@
+how_many_processors [ 1]
+gpu_identifier_set [ 0]
+gpu_motor [spp]
+cluster_header [cluster_header.sh]
+cluster_walltime [00:10:00]
+submit_order [sbatch]
+matlab_workers_average [ 0]

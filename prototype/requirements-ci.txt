@@ -1,0 +1,4 @@
+# CPU-only test dependencies (GitHub Actions). The GPU code additionally needs cupy-cuda12x (see README).
+numpy>=1.26
+scipy>=1.11
+pytest>=8

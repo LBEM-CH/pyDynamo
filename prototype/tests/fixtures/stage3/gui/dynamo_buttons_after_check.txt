@@ -1,0 +1,9 @@
+pushbutton_data on
+pushbutton_table on
+pushbutton_template on
+pushbutton_masks on
+pushbutton_settings on
+pushbutton_hardware on
+pushbutton_check on
+pushbutton_unfold on
+pushbutton_run off

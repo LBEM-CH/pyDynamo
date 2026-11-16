@@ -1,0 +1,9 @@
+#!/bin/bash
+# pydyn `dcp`: the Dynamo 1.1.514 project manager (pydyn/webui; dcp --help). Usage: dcp [NAME [-option value ...]]
+# Same as .envs/pydynamo/bin/dcp (pip install -e .): pydyn.cli.dcp_main, which also restarts itself in a clean
+# environment (no PYTHONPATH / LD_LIBRARY_PATH from SBGrid / 4d / conda). DISPLAY is kept.
+HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+PY="$(cd "$HERE/.." && pwd)/.envs/pydynamo/bin/python"
+exec env -u PYTHONPATH -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONUSERBASE -u LD_LIBRARY_PATH -u LD_PRELOAD \
+  PYTHONNOUSERSITE=1 PIP_CONFIG_FILE=/dev/null "$PY" -I -c \
+  "import sys; sys.path.insert(0, '$HERE'); from pydyn.cli import dcp_main; sys.exit(dcp_main())" "$@"

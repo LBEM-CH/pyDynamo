@@ -1,0 +1,11 @@
+name_project|name|g1
+path|path|/work/dynamo_reference/gui/workG
+intertwin|intertwin|1/2/3/4/5/6/7/8
+apix|apix| 1
+initial_references|initial references|*
+runfrom|runfrom| 1
+symmetrize_with_fmask|symmetrize with fmask| 1
+project_type|project_type|general
+update_fmask|update fourier mask| 1
+update_with_unweighted_average|update with unweighted average| 0
+fourierMinimumFractionForAverage|fmin fraction| -1

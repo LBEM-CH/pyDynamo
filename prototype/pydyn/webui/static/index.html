@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en" data-bs-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pyDynamo dcp</title>
+<link rel="stylesheet" href="/static/vendor/bootstrap-5.3.3/css/bootstrap.min.css">
+<link rel="stylesheet" href="/static/vendor/bootstrap-icons-1.11.3/bootstrap-icons.min.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="topbar-progress"></div>
+<div class="app" id="app">
+
+  <!-- header: project box and Dynamo's menus (dynamo_project_manager_easy.fig) -->
+  <header class="app-head">
+    <div class="brand"><span class="logo"><i class="bi bi-boxes"></i></span><b>pyDynamo</b><small>dcp &middot; Dynamo 1.1.514</small></div>
+    <div class="project-switch">
+      <div class="input-group input-group-sm">
+        <span class="input-group-text"><i class="bi bi-folder2-open"></i></span>
+        <input id="projectInput" class="form-control mono" placeholder="project name (Enter opens or creates it)" autocomplete="off" spellcheck="false">
+        <button id="projectOpen" class="btn btn-primary" type="button">Open</button>
+        <button class="btn btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown" type="button" id="projectsBtn" title="projects in this folder">Projects</button>
+        <ul class="dropdown-menu dropdown-menu-end" id="projectsMenu"></ul>
+      </div>
+    </div>
+    <div class="head-right">
+      <span class="busy-pill"><span class="spinner-border spinner-border-sm"></span><span id="busyText">working</span></span>
+      <div class="dropdown">
+        <button class="btn btn-sm btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown" type="button">View</button>
+        <ul class="dropdown-menu dropdown-menu-end">
+          <li><a class="dropdown-item" href="#" data-act="view_last_averages"><i class="bi bi-badge-3d me-2"></i>Last computed average(s)</a></li>
+          <li><a class="dropdown-item disabled" href="#">Last computed table <small>[not ported]</small></a></li>
+          <li><a class="dropdown-item disabled" href="#">All seed files <small>[not ported]</small></a></li>
+        </ul>
+      </div>
+      <div class="dropdown">
+        <button class="btn btn-sm btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown" type="button">Multireference</button>
+        <ul class="dropdown-menu dropdown-menu-end">
+          <li><a class="dropdown-item" href="#" data-act="create_even_odd_project">Create an even/odd project</a></li>
+          <li><hr class="dropdown-divider"></li>
+          <li><h6 class="dropdown-header sub">Adaptive filtering ("golden standard")</h6></li>
+          <li><a class="dropdown-item indent" href="#" data-act="golden_standard_derive">Derive a project.</a></li>
+          <li><a class="dropdown-item indent" href="#" data-act="abp_dialog">Edit parameters for Adaptive Filtering run</a></li>
+          <li><a class="dropdown-item indent" href="#" data-act="plot_adaptive_filtering_fsc">Plot attained resolution FSC for all iterations</a></li>
+        </ul>
+      </div>
+      <button class="btn btn-sm btn-outline-secondary" id="themeBtn" title="light / dark"><i class="bi bi-moon-stars"></i></button>
+    </div>
+  </header>
+
+  <!-- sidebar: the steps of the main window (S/@dcp/stepOrdering.m) -->
+  <aside class="app-side">
+    <div class="proj-card" id="projCard"></div>
+    <div class="side-label">Workflow</div>
+    <ul class="steps" id="steps"></ul>
+    <div class="side-foot">Parameters are saved into the project as soon as they are entered, as in Dynamo.<br>
+      <kbd class="k">Ctrl</kbd> <kbd class="k">+</kbd>/<kbd class="k">-</kbd> zoom</div>
+  </aside>
+
+  <main class="app-main" id="main"></main>
+
+  <!-- the message list of the main window -->
+  <section class="app-dock" id="dock">
+    <div class="dock-grip" id="dockGrip"></div>
+    <div class="dock-head">
+      <i class="bi bi-terminal"></i><b>Messages</b><span id="msgCount"></span>
+      <div class="ms-auto d-flex gap-1">
+        <button class="btn btn-outline-secondary" id="msgCopy" title="copy all messages"><i class="bi bi-clipboard"></i></button>
+        <button class="btn btn-outline-secondary" id="msgClear" title="clear the view (the project is not touched)"><i class="bi bi-eraser"></i></button>
+        <button class="btn btn-outline-secondary" id="msgToggle" title="hide / show"><i class="bi bi-chevron-down"></i></button>
+      </div>
+    </div>
+    <div class="console" id="console"></div>
+  </section>
+</div>
+
+<!-- file chooser: the files of this machine (not of the computer showing the window) -->
+<div class="modal fade" id="fsModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title" id="fsTitle">Choose a file</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body">
+      <div class="input-group input-group-sm mb-2">
+        <button class="btn btn-outline-secondary" id="fsUp" title="parent folder"><i class="bi bi-arrow-up"></i></button>
+        <button class="btn btn-outline-secondary" id="fsHome" title="project folder"><i class="bi bi-house"></i></button>
+        <input class="form-control mono" id="fsPath" spellcheck="false">
+        <button class="btn btn-outline-secondary" id="fsGo">Go</button>
+      </div>
+      <div class="d-flex align-items-center gap-3 mb-2">
+        <div class="input-group input-group-sm" style="max-width:320px"><span class="input-group-text"><i class="bi bi-funnel"></i></span><input class="form-control" id="fsFilter" placeholder="filter names" spellcheck="false"></div>
+        <div class="form-check form-switch small mb-0"><input class="form-check-input" type="checkbox" id="fsAll"><label class="form-check-label" for="fsAll">show all files</label></div>
+        <span class="small text-body-secondary ms-auto" id="fsCount"></span></div>
+      <div class="fs-list" id="fsList"></div>
+    </div>
+    <div class="modal-footer">
+      <span class="me-auto small text-body-secondary mono" id="fsSel"></span>
+      <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+      <button class="btn btn-primary" id="fsOk">Use</button>
+    </div>
+  </div></div>
+</div>
+
+<!-- adaptive bandpass parameters (ABPManager/launchGUI.m) -->
+<div class="modal fade" id="abpModal" tabindex="-1">
+  <div class="modal-dialog"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Adaptive bandpass parameters</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body" id="abpBody"></div>
+    <div class="modal-footer"><span class="me-auto small text-body-secondary">Each value is checked and saved when you press Save (or Enter).</span><button class="btn btn-primary" data-bs-dismiss="modal">Done</button></div>
+  </div></div>
+</div>
+
+<!-- confirmation -->
+<div class="modal fade" id="askModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title" id="askTitle"></h5></div>
+    <div class="modal-body" id="askBody"></div>
+    <div class="modal-footer"><button class="btn btn-outline-secondary" id="askNo">No</button><button class="btn btn-primary" id="askYes">Yes</button></div>
+  </div></div>
+</div>
+
+<script src="/static/vendor/bootstrap-5.3.3/js/bootstrap.bundle.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

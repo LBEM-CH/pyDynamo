@@ -1,0 +1,40 @@
+# Environments, caches and build artefacts (re-create: requirements/README-env.txt)
+.envs/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+
+# Local only, never committed: data, benchmark runs, analysis notes, third-party downloads
+test_data/
+benchmarks/
+docs/analysis/
+external/*
+!external/README.md
+
+# Data files anywhere: volumes, tables, arrays, archives
+*.em
+*.mrc
+*.mrcs
+*.rec
+*.btbl
+*.btbl.pydyn
+*.tbl
+*.npy
+*.npz
+*.h5
+*.mat
+*.tar
+*.tar.gz
+
+# Profiler and job output
+*.nsys-rep
+*.sqlite
+slurm-*.out
+
+# Editors and NFS
+*~
+*.asv
+.vscode/
+.nfs*

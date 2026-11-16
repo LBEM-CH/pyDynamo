@@ -1,0 +1,2 @@
+edit_semiaxis [ 31 31 31]
+text_size [ 64 64 64]

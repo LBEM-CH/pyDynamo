@@ -1,0 +1,6 @@
+# 
+# Just source this script 
+# or write bin4_align_1.sh on your shell
+#  You may need to chmod the script to give yourself execution permission
+ 
+dynamo_execute_project bin4_align_1

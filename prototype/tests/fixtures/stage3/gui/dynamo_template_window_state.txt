@@ -1,0 +1,4 @@
+radiobutton_random 0
+radiobutton_random_table 0
+radiobutton_fourierCompensation 0
+edit_samples 50

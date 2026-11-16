@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu-tests:
+    # GitHub-hosted runners have no GPU: GPU tests (marker "gpu") are skipped here and run locally on the cluster.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install CPU dependencies
+        run: python -m pip install --upgrade pip && pip install -r prototype/requirements-ci.txt
+      - name: Compile all Python files
+        run: python -m compileall -q prototype
+      - name: Unit tests (CPU)
+        run: python -m pytest -m "not gpu"
+      - name: No large or data files tracked
+        run: |
+          bad=$(git ls-files -z | xargs -0 -I{} sh -c 'f="{}"; s=$(stat -c %s "$f"); case "$f" in *.em|*.mrc|*.mrcs|*.rec|*.btbl|*.npy|*.npz|*.h5|*.tar|*.gz) echo "data file: $f";; esac; [ "$s" -gt 1048576 ] && echo "large file: $f ($s bytes)"; true')
+          if [ -n "$bad" ]; then echo "$bad"; exit 1; fi

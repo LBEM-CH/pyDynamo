@@ -1,0 +1,15 @@
+#!/bin/bash
+# Rejects commits that add files larger than MAX_KB (default 1024 KB) or volume/data files.
+# Install once after `git init`:  cp tools/git-hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+MAX_KB=${PYDYN_MAX_FILE_KB:-1024}
+bad=0
+while IFS= read -r -d '' f; do
+  [ -f "$f" ] || continue
+  kb=$(( $(stat -c %s "$f") / 1024 ))
+  case "$f" in
+    *.em|*.mrc|*.mrcs|*.rec|*.st|*.tif|*.tiff|*.btbl|*.npy|*.npz|*.h5|*.nsys-rep|*.sqlite|*.tar|*.gz|*.zip)
+      echo "pre-commit: refusing data/binary file: $f (${kb} KB)"; bad=1 ;;
+  esac
+  if [ "$kb" -gt "$MAX_KB" ]; then echo "pre-commit: refusing large file: $f (${kb} KB > ${MAX_KB} KB)"; bad=1; fi
+done < <(git diff --cached --name-only --diff-filter=AM -z)
+[ $bad -eq 0 ] || { echo "Unstage with: git rm --cached <file>   (or raise PYDYN_MAX_FILE_KB)"; exit 1; }

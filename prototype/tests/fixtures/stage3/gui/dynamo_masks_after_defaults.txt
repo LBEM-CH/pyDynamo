@@ -1,0 +1,5 @@
+edit_semiaxis [31 31 31]
+edit_mask [g1/settings/automatic_mask.em]
+edit_cmask [g1/settings/automatic_cmask.em]
+edit_fmask [./g1/settings/fmask_initial_ref_001.em]
+edit_smask [g1/settings/smoothingMaskOnes.em]
