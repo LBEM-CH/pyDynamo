@@ -78,6 +78,11 @@ class _FFTW:
     def __init__(self, path):
         lib = ctypes.CDLL(path)
         self.path = path
+        try:                                                # e.g. 'fftw-3.3.8-sse2-avx': which build gives the bits
+            # const char fftw_version[] (an array, not a pointer): read the string at the symbol itself
+            self.version = ctypes.string_at(ctypes.addressof(ctypes.c_char.in_dll(lib, "fftw_version"))).decode()
+        except (ValueError, AttributeError):
+            self.version = "unknown version"
         self._keep = []
         if hasattr(lib, "fftw_set_malloc_fcn"):
             # the MathWorks build routes fftw_malloc through hooks that MATLAB installs; without MATLAB they are
@@ -163,7 +168,8 @@ def _fftw_candidates():
 
 
 def fft_backend():
-    """'fftw:<library>' or 'scipy' (see the module doc)."""
+    """'fftw:<library> (<fftw_version>)' or 'scipy' (see the module doc). Bit-identity with MATLAB was measured with
+    fftw-3.3.8-sse2-avx; other builds are not verified."""
     if "b" not in _BACKEND:
         _BACKEND["b"] = None
         for path in _fftw_candidates():
@@ -174,7 +180,7 @@ def fft_backend():
                 except OSError:
                     continue
     b = _BACKEND["b"]
-    return "scipy" if b is None else "fftw:%s" % b.path
+    return "scipy" if b is None else "fftw:%s (%s)" % (b.path, b.version)
 
 
 def _filter_local(a, filt):

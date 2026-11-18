@@ -1,5 +1,6 @@
-"""fdlibm's sin, cos, atan, atan2 and acos (Sun's freely distributable libm 5.3: k_sin.c, k_cos.c, e_rem_pio2.c,
-s_sin.c, s_cos.c, s_atan.c, e_atan2.c, e_acos.c), ported operation for operation in double precision (no FMA).
+"""fdlibm's sin, cos, atan, atan2, acos and pow (Sun's freely distributable libm 5.3: k_sin.c, k_cos.c,
+e_rem_pio2.c, s_sin.c, s_cos.c, s_atan.c, e_atan2.c, e_acos.c, e_pow.c), ported operation for operation in double
+precision (no FMA).
 
 Dynamo 1.1.514 runs on MATLAB R2019a, whose scalar trigonometry is fdlibm: these functions return MATLAB's values
 bit for bit (2,000,000 angles for sin/cos against the MATLAB runtime's own routines). pyDynamo uses them wherever
@@ -309,3 +310,170 @@ def _vectorise(f):
 
 sin_array = _vectorise(sin)
 cos_array = _vectorise(cos)
+
+
+# ----------------------------------------------------------------------------------------------- e_pow.c
+_BP, _DP_H, _DP_L = (1.0, 1.5), (0.0, 5.84962487220764160156e-01), (0.0, 1.35003920212974897128e-08)
+_TWO53, _HUGE = 9007199254740992.0, 1.0e300
+_L1, _L2, _L3 = 5.99999999999994648725e-01, 4.28571428578550184252e-01, 3.33333329818377432918e-01
+_L4, _L5, _L6 = 2.72728123808534006489e-01, 2.30660745775561754067e-01, 2.06975017800338417784e-01
+_P1, _P2, _P3 = 1.66666666666666019037e-01, -2.77777777770155933842e-03, 6.61375632143793436117e-05
+_P4, _P5 = -1.65339022054652515390e-06, 4.13813679705723846039e-08
+_LG2, _LG2_H, _LG2_L = 6.93147180559945286227e-01, 6.93147182464599609375e-01, -1.90465429995776804525e-09
+_OVT = 8.0085662595372944372e-17
+_CP, _CP_H, _CP_L = 9.61796693925975554329e-01, 9.61796700954437255859e-01, -7.02846165095275826516e-09
+_IVLN2, _IVLN2_H, _IVLN2_L = 1.44269504088896338700e+00, 1.44269502162933349609e+00, 1.92596299112661746887e-08
+
+
+def _words(hi, lo):
+    return struct.unpack("<d", struct.pack("<Q", ((hi & 0xffffffff) << 32) | (lo & 0xffffffff)))[0]
+
+
+def _set_hi(x, hi):
+    return _words(hi, _lo(x))
+
+
+def pow(x, y):
+    """x^y of two doubles, as fdlibm's __ieee754_pow (MATLAB's scalar power)."""
+    x, y = float(x), float(y)
+    hx, lx, hy, ly = _hi(x), _lo(x), _hi(y), _lo(y)
+    ix, iy = hx & 0x7fffffff, hy & 0x7fffffff
+    if (iy | ly) == 0:                                         # x**0 = 1
+        return 1.0
+    if ix > 0x7ff00000 or (ix == 0x7ff00000 and lx != 0) or iy > 0x7ff00000 or (iy == 0x7ff00000 and ly != 0):
+        return x + y                                           # NaN
+    yisint = 0                                                 # 0: not an integer, 1: odd, 2: even (when x < 0)
+    if hx < 0:
+        if iy >= 0x43400000:
+            yisint = 2
+        elif iy >= 0x3ff00000:
+            k = (iy >> 20) - 0x3ff
+            if k > 20:
+                j = ly >> (52 - k)
+                if ((j << (52 - k)) & 0xffffffff) == ly:
+                    yisint = 2 - (j & 1)
+            elif ly == 0:
+                j = iy >> (20 - k)
+                if (j << (20 - k)) == iy:
+                    yisint = 2 - (j & 1)
+    if ly == 0:
+        if iy == 0x7ff00000:                                   # y = +-inf
+            if ((ix - 0x3ff00000) | lx) == 0:
+                return y - y
+            if ix >= 0x3ff00000:
+                return y if hy >= 0 else 0.0
+            return -y if hy < 0 else 0.0
+        if iy == 0x3ff00000:                                   # y = +-1
+            return 1.0 / x if hy < 0 else x
+        if hy == 0x40000000:                                   # y = 2
+            return x * x
+        if hy == 0x3fe00000 and hx >= 0:                       # y = 0.5, x >= +0
+            return math.sqrt(x)
+    ax = abs(x)
+    if lx == 0 and ix in (0x7ff00000, 0, 0x3ff00000):         # x = +-0, +-inf, +-1
+        z = ax
+        if hy < 0:
+            z = 1.0 / z
+        if hx < 0:
+            if ((ix - 0x3ff00000) | yisint) == 0:
+                z = float("nan")                               # (-1)**non-int
+            elif yisint == 1:
+                z = -z
+        return z
+    n = (hx >> 31) + 1                                         # 0 for x < 0, 1 otherwise
+    if (n | yisint) == 0:
+        return float("nan")                                    # (x<0)**(non-int)
+    s = -1.0 if (n | (yisint - 1)) == 0 else 1.0
+    if iy > 0x41e00000:                                        # |y| > 2**31
+        if iy > 0x43f00000:
+            if ix <= 0x3fefffff:
+                return _HUGE * _HUGE if hy < 0 else _TINY * _TINY
+            if ix >= 0x3ff00000:
+                return _HUGE * _HUGE if hy > 0 else _TINY * _TINY
+        if ix < 0x3fefffff:
+            return s * _HUGE * _HUGE if hy < 0 else s * _TINY * _TINY
+        if ix > 0x3ff00000:
+            return s * _HUGE * _HUGE if hy > 0 else s * _TINY * _TINY
+        t = ax - 1.0
+        w = (t * t) * (0.5 - t * (0.3333333333333333333333 - t * 0.25))
+        u = _IVLN2_H * t
+        v = t * _IVLN2_L - w * _IVLN2
+        t1 = _with_lo_zero(u + v)
+        t2 = v - (t1 - u)
+    else:
+        n = 0
+        if ix < 0x00100000:                                    # subnormal x
+            ax *= _TWO53
+            n -= 53
+            ix = _hi(ax)
+        n += (ix >> 20) - 0x3ff
+        j = ix & 0x000fffff
+        ix = j | 0x3ff00000
+        if j <= 0x3988E:
+            k = 0
+        elif j < 0xBB67A:
+            k = 1
+        else:
+            k = 0
+            n += 1
+            ix -= 0x00100000
+        ax = _set_hi(ax, ix)
+        u = ax - _BP[k]
+        v = 1.0 / (ax + _BP[k])
+        ss = u * v
+        s_h = _with_lo_zero(ss)
+        t_h = _words(((ix >> 1) | 0x20000000) + 0x00080000 + (k << 18), 0)
+        t_l = ax - (t_h - _BP[k])
+        s_l = v * ((u - s_h * t_h) - s_h * t_l)
+        s2 = ss * ss
+        r = s2 * s2 * (_L1 + s2 * (_L2 + s2 * (_L3 + s2 * (_L4 + s2 * (_L5 + s2 * _L6)))))
+        r += s_l * (s_h + ss)
+        s2 = s_h * s_h
+        t_h = _with_lo_zero(3.0 + s2 + r)
+        t_l = r - ((t_h - 3.0) - s2)
+        u = s_h * t_h
+        v = s_l * t_h + t_l * ss
+        p_h = _with_lo_zero(u + v)
+        p_l = v - (p_h - u)
+        z_h = _CP_H * p_h
+        z_l = _CP_L * p_h + p_l * _CP + _DP_L[k]
+        t = float(n)
+        t1 = _with_lo_zero(((z_h + z_l) + _DP_H[k]) + t)
+        t2 = z_l - (((t1 - t) - _DP_H[k]) - z_h)
+    y1 = _with_lo_zero(y)
+    p_l = (y - y1) * t1 + y * t2
+    p_h = y1 * t1
+    z = p_l + p_h
+    j, i = _hi(z), _lo(z)
+    if j >= 0x40900000:                                        # z >= 1024
+        if ((j - 0x40900000) | i) != 0 or p_l + _OVT > z - p_h:
+            return s * _HUGE * _HUGE
+    elif (j & 0x7fffffff) >= 0x4090cc00:                       # z <= -1075
+        if ((j - (0xc090cc00 - 0x100000000)) | i) != 0 or p_l <= z - p_h:
+            return s * _TINY * _TINY
+    i = j & 0x7fffffff
+    k = (i >> 20) - 0x3ff
+    n = 0
+    if i > 0x3fe00000:                                         # |z| > 0.5: n = [z + 0.5]
+        n = j + (0x00100000 >> (k + 1))
+        k = ((n & 0x7fffffff) >> 20) - 0x3ff
+        t = _words(n & ~(0x000fffff >> k), 0)
+        n = ((n & 0x000fffff) | 0x00100000) >> (20 - k)
+        if j < 0:
+            n = -n
+        p_h -= t
+    t = _with_lo_zero(p_l + p_h)
+    u = t * _LG2_H
+    v = (p_l - (t - p_h)) * _LG2 + t * _LG2_L
+    z = u + v
+    w = v - (z - u)
+    t = z * z
+    t1 = z - t * (_P1 + t * (_P2 + t * (_P3 + t * (_P4 + t * _P5))))
+    r = (z * t1) / (t1 - 2.0) - (w + z * w)
+    z = 1.0 - (r - z)
+    j = _hi(z) + (n << 20)
+    if (j >> 20) <= 0:
+        z = math.ldexp(z, n)                                   # subnormal result (scalbn)
+    else:
+        z = _set_hi(z, _hi(z) + (n << 20))
+    return s * z

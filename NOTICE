@@ -17,7 +17,7 @@ Dynamo is distributed under the following notice:
   The Software is provided "as is", without warranty of any kind.
 
 pydyn/fdlibm.py and pydyn.masks.matlab_exp are ports of fdlibm (Sun's freely distributable libm 5.3;
-k_sin.c, k_cos.c, e_rem_pio2.c, s_sin.c, s_cos.c, s_atan.c, e_atan2.c, e_acos.c, e_exp.c), whose notice is:
+k_sin.c, k_cos.c, e_rem_pio2.c, s_sin.c, s_cos.c, s_atan.c, e_atan2.c, e_acos.c, e_pow.c, e_exp.c), whose notice is:
 
   Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
 

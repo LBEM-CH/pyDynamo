@@ -14,6 +14,8 @@ import os
 
 import numpy as np
 
+from . import matlab_numerics as MN
+
 from . import dynio
 
 
@@ -30,17 +32,11 @@ def fsc(a, b):
     n = a.shape[0]
     if a.shape != (n, n, n) or n % 2:
         raise NotImplementedError("dynamo_fsc of a non-cubic or odd box")
-    A = np.fft.fftshift(np.fft.fftn(a))
-    B = np.fft.fftshift(np.fft.fftn(b))
-    Nm, A2, B2 = A * np.conj(B), A * np.conj(A), B * np.conj(B)
     u = np.arange(-n // 2, n // 2, dtype=np.float64)
     uz, uy, ux = np.meshgrid(u, u, u, indexing="ij")
     R = np.sqrt(ux * ux + uy * uy + uz * uz)
-    out = np.empty(n // 2)
-    for k in range(1, n // 2 + 1):
-        s = (R >= k) & (R < k + 1)
-        out[k - 1] = np.real(np.sum(Nm[s])) / (math.sqrt(np.real(np.sum(A2[s]))) * math.sqrt(np.real(np.sum(B2[s]))))
-    return out
+    # FFTW, products rounded separately and sequential shell sums, as MATLAB (pydyn.matlab_numerics.shell_fsc)
+    return MN.shell_fsc(a, b, [(R >= k) & (R < k + 1) for k in range(1, n // 2 + 1)])
 
 
 def fsc_resolution(curve, threshold):

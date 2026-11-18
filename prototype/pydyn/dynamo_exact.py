@@ -609,7 +609,7 @@ extern "C" __global__ void nc2f_b(const float2* rr, const float2* rm, float* f_r
 }
 extern "C" __global__ void iamax_b(const float* x, int* out, const long long n, const long long stride, const int step,
                                    const int plus1)
-{   // volume blockIdx.x: 1-based index of the first largest |x| (a NaN never wins a comparison); 0 if none.
+{   // volume blockIdx.x: 1-based index of the first largest |x| (a NaN never wins a comparison); 1 if all NaN.
     // plus1: x is the complex RD map (step 2) and the value is x.re + 1, as copy_cufft2float_plus_one writes it (4420)
     __shared__ float sv[256];
     __shared__ long long si[256];
@@ -630,7 +630,7 @@ extern "C" __global__ void iamax_b(const float* x, int* out, const long long n, 
         }
         __syncthreads();
     }
-    if (t == 0) out[blockIdx.x] = (si[0] < n) ? (int)(si[0] + 1) : 0;
+    if (t == 0) out[blockIdx.x] = (si[0] < n) ? (int)(si[0] + 1) : 1;   // all NaN: 1, as legacy cuBLAS 8 (measured)
 }
 extern "C" __global__ void div_b(const float* a, const float* b, float* out, const int B)
 {   // spp.cu:4193 mean = sum / nnz (float / float, round to nearest)
@@ -674,6 +674,15 @@ def _note(msg):
     """One line on stderr (not in the project's log.txt, which follows Dynamo line by line)."""
     import sys
     print(f"pyDynamo exact engine: {msg}", file=sys.stderr, flush=True)
+
+
+def _nan_cases(N, rs):
+    """Self-check vectors with NaNs (cuBLAS 8 Isamax ignores NaNs; for an all-NaN vector it returns 1)."""
+    v = [np.full(N, np.nan, np.float32)]
+    a = rs.standard_normal(N).astype(np.float32); a[0] = np.nan; v.append(a)
+    a = rs.standard_normal(N).astype(np.float32); a[rs.randint(0, N, 50)] = np.nan; v.append(a)
+    a = rs.standard_normal(N).astype(np.float32); a[1000] = 50.0; a[:1000] = np.nan; v.append(a)
+    return np.stack(v)
 
 
 class BatchedOps:
@@ -758,11 +767,15 @@ class BatchedOps:
                 break
         if self.G_asum is None:
             raise RuntimeError("no modelled grid reproduces cublasSasum on this GPU")
-        pos = cp.zeros(B, cp.int32)
-        want = np.array([L.iamax(X[b]) for b in range(B)], np.int32)
-        self.iamax(X, B, pos)
-        if not np.array_equal(pos.get(), want):
-            raise RuntimeError("batched Isamax does not reproduce cublasIsamax on this GPU: %s vs %s" % (pos.get(), want))
+        Xn = _nan_cases(N, rs)                               # NaNs: ignored; all NaN -> 1 (cuBLAS 8, measured)
+        for XX in (X, cp.asarray(Xn)):
+            Bx = len(XX)
+            pos = cp.zeros(Bx, cp.int32)
+            want = np.array([L.iamax(XX[b]) for b in range(Bx)], np.int32)
+            self.iamax(XX, Bx, pos)
+            if not np.array_equal(pos.get(), want):
+                raise RuntimeError("batched Isamax does not reproduce cublasIsamax on this GPU: %s vs %s"
+                                   % (pos.get(), want))
 
 
 # ----------------------------------------------------------------------------------------------- host arithmetic
@@ -985,6 +998,16 @@ class DynamoExact:
         if not (np.array_equal(pos.get(), want) and np.array_equal(pos2.get(), want)):
             raise RuntimeError("fuse=1: Isamax of RD.re + 1 differs from plus_one + cublasIsamax: %s %s vs %s"
                                % (pos.get(), pos2.get(), want))
+        xn = cp.asarray(_nan_cases(N, rs).astype(np.complex64))   # NaN maps through the folded +1 as well
+        Bn = len(xn)
+        f1n = cp.zeros((Bn, N), cp.float32)
+        kb["plus_one"]((n, n, Bn), blk, (xn, f1n, n32, C, R))
+        wantn = np.array([L.iamax(f1n[b]) for b in range(Bn)], np.int32)
+        posn = cp.zeros(Bn, cp.int32)
+        ops.iamax(xn, Bn, posn, plus1=True)
+        if not np.array_equal(posn.get(), wantn):
+            raise RuntimeError("fuse=1: Isamax of RD.re + 1 with NaNs differs from cublasIsamax: %s vs %s"
+                               % (posn.get(), wantn))
         v1, v2 = cp.zeros(7 * B, cp.float32), cp.zeros(7 * B, cp.float32)
         z1, z2 = cp.zeros(3 * B, cp.int32), cp.zeros(3 * B, cp.int32)
         ops.peak7(f1, pos, v1, z1, B)

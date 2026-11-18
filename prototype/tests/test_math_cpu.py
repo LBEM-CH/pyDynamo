@@ -160,4 +160,5 @@ def test_fdlibm_trig_equals_matlab_runtime_values():
     assert all(F.sin(h(x)).hex() == y for x, y in fx["sin"]) and all(F.cos(h(x)).hex() == y for x, y in fx["cos"])
     assert all(F.atan2(h(y), h(x)).hex() == z for y, x, z in fx["atan2"])
     assert all(F.acos(h(x)).hex() == y for x, y in fx["acos"])
+    assert all(F.pow(h(x), h(y)).hex() == z for x, y, z in fx["pow"])           # MATLAB scalar ^ (e_pow.c)
     assert math.copysign(1.0, F.sin(-0.0)) == -1.0 and F.acos(1.0) == 0.0 and F.atan2(0.0, -1.0) == math.pi
