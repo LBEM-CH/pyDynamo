@@ -1,6 +1,6 @@
 """Compare two Dynamo tables (.btbl or .tbl) particle by particle (rows matched by tag, column 1).
 
-python compare_tables.py A B [--truth T]   ->  JSON summary
+python dev/compare_tables.py A B [--truth T]   ->  JSON summary
 """
 import argparse
 import json
@@ -9,7 +9,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # prototype/
 from pydyn import emio  # noqa: E402
 from pydyn.angles import rotation_matrices  # noqa: E402
 

@@ -14,6 +14,19 @@ def test_em_roundtrip_keeps_xyz_order(tmp_path):
     assert np.array_equal(emio.read_em(p), v)
 
 
+def test_em_stack_threaded_equals_serial_read(tmp_path):
+    rs = np.random.RandomState(3)
+    paths = []
+    for k in range(37):
+        p = tmp_path / f"particle_{k}.em"
+        emio.write_em(p, rs.standard_normal((6, 5, 4)).astype(np.float32))
+        paths.append(p)
+    serial = np.stack([emio.read_em(p).astype(np.float32) for p in paths])
+    for threads in (1, 8):
+        got = emio.read_em_stack(paths, threads=threads)
+        assert got.dtype == np.float32 and np.array_equal(got.view(np.int32), serial.view(np.int32))
+
+
 def test_btbl_and_tbl_roundtrip(tmp_path):
     t = np.arange(3 * 35, dtype=np.float32).reshape(3, 35)
     emio.write_btbl(tmp_path / "t.btbl", t)

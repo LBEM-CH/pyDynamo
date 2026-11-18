@@ -1,8 +1,8 @@
 """One dcp session behind the HTML view: the DcpController, its messages, and JSON-ready results.
 
 The HTML view (pydyn.webui.static) has no logic of its own. Every action is a call of a whitelisted DcpController
-method (ACTIONS) or one of the few view-level actions that the Tk view also had (VIEW_ACTIONS: closing the masks
-window, the mask editor, the run hint after unfold). Errors are handled as in the Tk view (pydyn.gui.DcpApp._guard):
+method (ACTIONS) or one of the few view-level actions (VIEW_ACTIONS: closing the masks
+window, the mask editor, the run hint after unfold). Errors are handled as Dynamo's dcp shows them:
 Dynamo errors and unported paths become red messages, never a crash.
 
 Calls are serialised with one lock (the controller is the global DYNCP of a dcp session, not thread-safe). Reading
@@ -338,7 +338,7 @@ class Session:
             self.lock.release()
 
     def _guard(self, fn, *a, **kw):
-        """pydyn.gui.DcpApp._guard: Dynamo errors and unported paths become red messages."""
+        """Dynamo errors and unported paths become red messages."""
         from ..vpr import DynamoError
         try:
             r = fn(*a, **kw)
@@ -546,7 +546,7 @@ class Session:
 
     # ------------------------------------------------------------------------------------------------ view actions
     def _v_masks_closed(self):
-        """dcp.closeRequestMasks (pydyn.gui.DcpApp._masks_closed): masks step right/wrong from the isCorrect flags."""
+        """dcp.closeRequestMasks masks step right/wrong from the isCorrect flags."""
         c = self.c
         ok = all(c.correct.get(k) for k in ("mask", "cmask", "fmask"))
         if not ok:
@@ -760,7 +760,7 @@ class Session:
         return self.c.runtime.get("destination")
 
     def _v_unfold_and_hint(self):
-        """Main window "unfold" (pydyn.gui.DcpApp.do_unfold): unfold, then the command to run. The .exe is written
+        """Main window "unfold": unfold, then the command to run. The .exe is written
         for the GPUs (destination standalone_gpu)."""
         self._ensure_gpu_destination()
         r = self.c.unfold()
@@ -769,7 +769,7 @@ class Session:
         return r
 
     def _v_run_hint(self):
-        """Main window "run" (pydyn.gui.DcpApp.do_run): the execution order of the project."""
+        """Main window "run": the execution order of the project."""
         order = self.c.execution_order()
         if order:
             self._echo("Execution order: %s  (run it from a terminal in %s)" % (order, os.getcwd()), "b")

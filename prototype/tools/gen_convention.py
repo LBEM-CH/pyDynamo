@@ -2,7 +2,8 @@
 
   python -I prototype/tools/gen_convention.py [/programs/.../1.1.514/matlab/src/dynamo_vpr_convention.m] > prototype/pydyn/convention.py
 
-tests/test_stage3_vpr.py re-parses the source (when it is present) and compares it with the checked-in table.
+tests/test_stage3.py::test_convention_table_matches_source re-parses the source (when it is present) and compares
+it with the checked-in table.
 """
 import os
 import pprint

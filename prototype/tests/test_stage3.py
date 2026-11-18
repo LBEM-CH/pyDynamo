@@ -2,7 +2,7 @@
 
 CPU tests run on small synthetic data and compare with Dynamo 1.1.514's own output kept as small text fixtures in
 tests/fixtures/stage3 (vpr field dumps, cards, .exe, .sel of benchmarks/04_journey_bin8_align_1/dynamo/dcpnew, runs A and B).
-Tests marked 'reference' compare with the full headless-Dynamo ground truth and skip when it is absent (CI).
+Tests that compare with the full headless-Dynamo ground truth skip (skipif) when it is absent (CI).
 """
 import filecmp
 import json
@@ -15,10 +15,10 @@ import pytest
 
 from conftest import CHECK_CLEAN
 
+from pydyn import dynamo_exact as X
 from pydyn import dynio
 from pydyn import vpr as V
 
-P_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, "fixtures", "stage3")
 P = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -158,7 +158,7 @@ def test_dcp_new_matches_dynamo_run_a(tmp_path, monkeypatch):
     f = os.path.join("bin8_align_1", "settings", "virtual_project.mat")
     _compare_json(_json_form(f), json.load(open(os.path.join(FIX, "dynamo_vpr_after_dcpnew.json"))))
     s = os.path.join("bin8_align_1", "settings")
-    from pydyn.project import default_mask
+    from pydyn.masks import default_mask
     assert open(os.path.join(s, "mask.em"), "rb").read() == dynio.em_bytes(default_mask(64))
     assert open(os.path.join(s, "mask_classification.em"), "rb").read() == dynio.em_bytes(default_mask(64))
     assert open(os.path.join(s, "fmask_initial_ref_001.em"), "rb").read() == dynio.em_bytes(np.full((64,) * 3, 64.))
@@ -424,6 +424,8 @@ def test_daverage_reference_bytes(tmp_path):
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(not (os.path.exists(X.ENGINE_BINARY) and os.path.exists(os.path.join(X.CUDA8_LIB, "libcufft.so.8.0"))),
+                    reason="needs Dynamo 1.1.514 and the CUDA 8 libraries (the default exact engine)")
 def test_exe_runs_one_iteration_in_place(tmp_path, monkeypatch):
     """dcp.new -> dvput -> dvunfold -> ./name.exe: one iteration in pure Python on GPU 0, in place."""
     from pydyn import dvput, dvunfold
@@ -441,7 +443,7 @@ def test_exe_runs_one_iteration_in_place(tmp_path, monkeypatch):
     shim.mkdir()
     (shim / "dynamo_execute_project").write_text(
         "#!/bin/sh\nexec %s -I -c \"import sys; sys.path.insert(0, %r); from pydyn.cli import execute_main; "
-        "sys.exit(execute_main())\" \"$@\"\n" % (sys.executable, os.path.join(P_ROOT, "prototype")))
+        "sys.exit(execute_main())\" \"$@\"\n" % (sys.executable, os.path.join(P, "prototype")))
     (shim / "dynamo_execute_project").chmod(0o755)
     out = subprocess.run(["bash", script], capture_output=True, text=True, timeout=900,
                          env={**os.environ, "PATH": "%s:%s" % (shim, os.environ["PATH"])})

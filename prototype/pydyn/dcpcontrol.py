@@ -1,7 +1,7 @@
-"""Controller of the dcp GUI (Dynamo 1.1.514 `dcp` / dynamo_project_manager_easy), without Tk.
+"""Controller of the dcp GUI (Dynamo 1.1.514 `dcp` / dynamo_project_manager_easy), without a display.
 
-The Tk view (pydyn.gui) only draws widgets and forwards the user's input here. Everything that reads or writes a
-project goes through implementer 1's API: pydyn.vpr (load/save/unfold/data_info/...), pydyn.dcptool.dcp
+The view (pydyn.webui: HTML in a Qt WebEngine window) only draws and forwards the user's input here. Everything that reads or writes a
+project goes through the project API: pydyn.vpr (load/save/unfold/data_info/...), pydyn.dcptool.dcp
 (new/put/set_project), pydyn.vprcheck.check (dvcheck), pydyn.console (dread/dwrite/daverage). There is no second
 project format: the project is ./<name>/settings/virtual_project.mat, as in Dynamo.
 

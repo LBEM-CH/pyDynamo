@@ -5,7 +5,7 @@ Specifications (every behaviour below is taken from them; section numbers are ci
   06b = docs/analysis/06b_assemble_1.1.514.md       (iteration assembly)
   06c = docs/analysis/06c_driver_formats_1.1.514.md (driver loop and file formats)
 Numerics of the GPU stages are the verified pydyn ports: engine.Engine (dynamo_compute_iteration_spp, run with
-dynamo_version 1.1.514) and average.partial_sums / average.finalize (dynamo_average, pipeline path).
+dynamo_version 1.1.514) and average.ordered_sums / average.finalize (dynamo_average, pipeline path).
 
 What is reproduced, in order, per iteration (06c A.2 / A.4):
   setup     surviving references (06a S2), angular freezing (S4) and shift freezing (S5) for every mode,
@@ -44,11 +44,12 @@ import traceback
 
 import numpy as np
 
+from . import fdlibm as _F
+
 from . import dynio, dynlog
 
 DYNAMO_VERSION = "1.1.514"
 DYNAMO_SRC = "/programs/x86_64-linux/dynamo/1.1.514/matlab/src"
-MCR_ROOT = "/programs/x86_64-linux/dynamo/1.1.514/MCRLinux"
 
 # Parameter order of dynamo_vpr_convention.m (1.1.514): the 'nc' (global) and 'rc' (round) cells in file order.
 # dynamo_pipeline_setup_card_ite.m:31-63 builds card_ite in this order. tests/test_dynproject.py checks these
@@ -84,11 +85,6 @@ def _datestr(t=None):
     lt = time.localtime(time.time() if t is None else t)
     return "%02d-%s-%04d %02d:%02d:%02d" % (lt.tm_mday, calendar.month_abbr[lt.tm_mon], lt.tm_year,
                                             lt.tm_hour, lt.tm_min, lt.tm_sec)
-
-
-def _mround(x):
-    """MATLAB round (half away from zero)."""
-    return math.floor(abs(x) + 0.5) * (1 if x >= 0 else -1)
 
 
 def check_report_path(path, project_dir):
@@ -208,43 +204,20 @@ def card_ite_from_vpr(vpr, ite):
 
 
 # =================================================================================================
-# MATLAB R2019a sin / cos (libmwmathutil) for exact column-28 parity (06b 3.3, 12.1)
+# MATLAB's scalar trigonometry (fdlibm, pydyn.fdlibm) for columns 27-30 (06b 3.3, 12.1)
 # =================================================================================================
 
-class MatlabTrig:
-    """mu::Sin<double> / mu::Cos<double> from the MCR's libmwmathutil.so, called through ctypes (06b 12.1).
-    This calls a math routine of the MATLAB runtime; it does not run MATLAB or Dynamo. Verification only."""
-
-    def __init__(self, mcr=MCR_ROOT):
-        ctypes.CDLL(os.path.join(mcr, "sys/os/glnxa64/libgcc_s.so.1"), mode=ctypes.RTLD_GLOBAL)
-        ctypes.CDLL(os.path.join(mcr, "sys/os/glnxa64/libstdc++.so.6"), mode=ctypes.RTLD_GLOBAL)
-        lib = ctypes.CDLL(os.path.join(mcr, "bin/glnxa64/libmwmathutil.so"))
-        self.sin = self._mk(lib, "_ZN2mu3SinIdEEvPT_S2_mmm")
-        self.cos = self._mk(lib, "_ZN2mu3CosIdEEvPT_S2_mmm")
-
-    @staticmethod
-    def _mk(lib, sym):
-        f = getattr(lib, sym)
-        f.restype = None
-        f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
-
-        def g(x):
-            x = np.ascontiguousarray(x, np.float64)
-            o = np.empty_like(x)
-            f(o.ctypes.data, x.ctypes.data, 1, 1, x.size)
-            return o
-        return g
-
-
-class NumpyTrig:
-    sin = staticmethod(np.sin)
-    cos = staticmethod(np.cos)
+class FdlibmTrig:
+    """sin / cos as MATLAB R2019a computes them (fdlibm; bit-identical, pydyn.fdlibm), so that column 28 matches
+    Dynamo's text exactly. NumPy's / the C library's sin and cos differ from MATLAB's in about 3 % of arguments."""
+    sin = staticmethod(_F.sin_array)
+    cos = staticmethod(_F.cos_array)
 
 
 def _acos_deg(d):
-    """MATLAB acos(d)*180/pi of a real scalar; complex for d > 1 (06b 3.3)."""
+    """MATLAB acos(d)*180/pi of a real scalar (fdlibm acos); complex for d > 1 (06b 3.3)."""
     if -1 <= d <= 1:
-        return complex(math.acos(d) * 180 / math.pi, 0)
+        return complex(_F.acos(d) * 180 / math.pi, 0)
     if d > 1:
         return complex(0, math.acosh(d) * 180 / math.pi)
     if math.isnan(d):
@@ -328,9 +301,10 @@ def isotropic_shell(n, r1, r2, smoothing):
     rad = np.sqrt(rx * rx + ry * ry + rz * rz)
     sm = np.zeros_like(rad)
     m2 = c2 > 1
-    sm[m2] = np.exp(-((r2 - rad[m2]) ** 2) / (smoothing * smoothing))
+    libm_exp = np.frompyfunc(math.exp, 1, 1)                        # the mex's C exp (NumPy's SIMD exp is host-dependent)
+    sm[m2] = libm_exp(-((r2 - rad[m2]) ** 2) / (smoothing * smoothing)).astype(np.float64)
     m1 = c1 < 1
-    sm[m1] = np.exp(-((r1 - rad[m1]) ** 2) / (smoothing * smoothing))
+    sm[m1] = libm_exp(-((r1 - rad[m1]) ** 2) / (smoothing * smoothing)).astype(np.float64)
     v = np.where((c1 >= 1) & (c2 <= 1), 1.0, np.where(sm > 0.13, sm, 0.0))
     return v.astype(np.float32).astype(np.float64)
 
@@ -345,17 +319,10 @@ def ellipsoid_inside(n, radius):
 
 
 def normalize_roi(v, mask):
-    """dynamo_normalize_roi.m:130-184: roi = v[mask != 0] without NaN; (v - mean) / std(roi - mean, ddof=1)."""
-    roi = v[(mask != 0) & ~np.isnan(v)]
-    mu = roi.mean()
-    sd = np.std(roi - mu, ddof=1)
-    return (v - mu) / sd
-
-
-def fweight_divide(v, F, tau):
-    """dynamo_fweight_divide.m:61-110 (same port as pydyn.average.fweight_divide)."""
-    from .average import fweight_divide as _fd
-    return _fd(v, F, tau)
+    """dynamo_normalize_roi.m:130-184: roi = v[mask != 0] without NaN; (v - mean) / std(roi - mean), with
+    single-thread MATLAB's sequential sums (pydyn.matlab_numerics)."""
+    from .matlab_numerics import normalize_roi as _n
+    return _n(v, mask)
 
 
 # =================================================================================================
@@ -434,7 +401,7 @@ def _gpu_worker(device, conn, cfg):
         from . import emio
         from .card import Card
         from .engine import Engine
-        from .average import partial_sums
+        from .average import ordered_sums
         cp.cuda.Device(device).use()
     except Exception:
         conn.send({"ok": False, "error": traceback.format_exc()})
@@ -471,7 +438,7 @@ def _gpu_worker(device, conn, cfg):
                 t_read = 0.0
                 if st["paths"] != paths:
                     t1 = time.perf_counter()
-                    st["particles"] = np.stack([emio.read_em(p).astype(np.float32) for p in paths])
+                    st["particles"] = emio.read_em_stack(paths)
                     if st["eng"] is not None:
                         st["eng"].close()                           # cuFFT 8 plans are not in CuPy's pool
                     st["paths"], st["eng"], st["eng_key"] = paths, None, None
@@ -524,29 +491,29 @@ def _gpu_worker(device, conn, cfg):
                         pl = [ln.strip() for ln in f if len(ln.strip()) > 4]
                     paths += [res(p) for p in pl]
                     rows.append(dynio.read_btbl(ch["starting_btbl"])[:len(pl)])
-                st["particles"] = np.stack([emio.read_em(p).astype(np.float32) for p in paths])
+                st["particles"] = emio.read_em_stack(paths)
                 if st["eng"] is not None:
                     st["eng"].close()
                 st["paths"], st["eng"], st["eng_key"] = paths, None, None
                 st["tags"] = np.concatenate(rows)[:, 0].astype(np.int64)
                 conn.send({"ok": True, "device": device, "particles": len(paths)})
+            elif msg["op"] == "tags":                              # resident tags of a slot (averaging order)
+                conn.send({"ok": True, "device": device,
+                           "tags": [] if st["tags"] is None else st["tags"].astype(np.int64)})
             elif msg["op"] == "average":
-                rows, half = msg["rows"], msg["half"]
-                pos = {int(t): i for i, t in enumerate(st["tags"].tolist())} if st["tags"] is not None else {}
-                sel = [i for i, t in enumerate(rows[:, 0].astype(np.int64).tolist()) if t in pos]
-                if not sel:
-                    conn.send({"ok": True, "device": device, "partial": None, "tags": []})
-                    continue
-                pidx = np.array([pos[int(rows[i, 0])] for i in sel])
-                parts = st["particles"] if np.array_equal(pidx, np.arange(len(st["tags"]))) else st["particles"][pidx]
-                ps = partial_sums(parts, rows[sel].astype(np.float32), half[sel], msg["mask"], batch="auto")
-                # the averaging's batches fill ~90% of the free GPU memory (memory balancer); hand it back to the
-                # driver, else CuPy's pool keeps it reserved through the next alignment, which needs ~3 GB (exact)
+                # add this worker's run of the ascending-tag order to the running sums (average.ordered_sums); the
+                # parent chains the state through the workers, so each half is one sequential sum as in Dynamo
+                rows = msg["rows"]
+                pos = {int(t): i for i, t in enumerate(st["tags"].tolist())}
+                pidx = np.array([pos[int(t)] for t in rows[:, 0]], dtype=np.int64)
+                contiguous = len(pidx) > 0 and np.array_equal(pidx, np.arange(pidx[0], pidx[0] + len(pidx)))
+                parts = st["particles"][pidx[0]:pidx[0] + len(pidx)] if contiguous else st["particles"][pidx]
+                state = ordered_sums(parts, rows.astype(np.float32), msg["half"], msg["nh"],
+                                     msg["mask"], msg["state"])
                 cp.cuda.Device().synchronize()
                 cp.fft.config.get_plan_cache().clear()
                 cp.get_default_memory_pool().free_all_blocks()
-                conn.send({"ok": True, "device": device, "partial": ps, "tags": rows[sel, 0].astype(np.int64),
-                           "wall_s": round(time.perf_counter() - t0, 3)})
+                conn.send({"ok": True, "device": device, "state": state, "wall_s": round(time.perf_counter() - t0, 3)})
             else:
                 raise ValueError("unknown op %r" % msg["op"])
         except Exception:
@@ -569,10 +536,9 @@ class DynamoProject:
     data:   the data folder (particle_<tag>.em); its name in the cards stays vpr.folder_data;
     gpus:   physical device ids to run on (default: the vpr's gpu_identifier_set). The GPU chunks and their file
             names always follow the vpr's gpu_identifier_set (06a S9.2); chunk i runs on gpus[i % len(gpus)].
-    matlab_trig: use MATLAB's own sin/cos for columns 27-30 (exact text parity of column 28, 06b 3.3).
     """
 
-    def __init__(self, source, data, out, gpus=None, matlab_trig=False, keep_temp=False, table_initial=None,
+    def __init__(self, source, data, out, gpus=None, keep_temp=False, table_initial=None,
                  echo=True, engine=None, exact_sms=None, report=None, progress_log=None):
         from .engine import preflight
         preflight(engine)                                            # before any project, setup or engine work (M1)
@@ -590,11 +556,7 @@ class DynamoProject:
         from .engine import engine_mode
         self.engine = engine_mode(engine)                            # GPU alignment engine: exact | fast
         self.exact_sms = exact_sms                                   # exact engine: emulate this SM count's cuBLAS 8
-        self.trig_name = "matlab-libmwmathutil" if matlab_trig else "numpy"
-        self.trig = MatlabTrig() if matlab_trig else NumpyTrig()
-        if matlab_trig:                                              # the ABP angle/table math too (pydyn.dalign)
-            from . import dalign
-            dalign.set_matlab_trig(True)
+        self.trig, self.trig_name = FdlibmTrig(), "fdlibm"           # MATLAB's sin/cos, bit for bit (pydyn.fdlibm)
         # vpr.file_table_initial is relative to Dynamo's working directory, the folder that contains the project
         fti = str(self.vpr["file_table_initial"])
         self.cwd = os.path.dirname(self.source)                      # Dynamo's working directory for vpr paths
@@ -979,6 +941,7 @@ class DynamoProject:
         dynio.write_em(self.p(self.r_mask_transformed(ite)), mask_bin)
         high, low = float(self.rv("high", rnd)), float(self.rv("low", rnd))
         from .symmetry import dynamo_sym
+        from .matlab_numerics import bandpass_filter
         op = self.rv("sym", rnd)
         with_fmask = float(self.vpr.get("symmetrize_with_fmask", 0)) != 0
         for ref in refs:
@@ -1003,7 +966,7 @@ class DynamoProject:
             # :432-433), else dynamo_sym(T, op) (:435).
             T = dynamo_sym(T, op, fb if with_fmask else None)[0]
             shell = isotropic_shell(L, high, low, 2.0)               # dynamo_bandpass smp = 2
-            T = np.real(np.fft.ifftn(np.fft.fftn(T) * np.fft.fftshift(shell)))
+            T = bandpass_filter(T, np.fft.fftshift(shell))             # real(ifftn(fftn(T).*shell)), FFTW
             T = normalize_roi(T, mask_bin)
             dynio.write_em(self.p(self.r_template_transformed(ref, ite)), T)
 
@@ -1332,24 +1295,45 @@ class DynamoProject:
         nmask = settings/mask.em (raw), fmin 3, even/odd halves of the sorted tags. `table` is used as given (the
         re-read text table for the pipeline average; the in-memory transformed table for the ABP re-average of
         reference 2, 09b 4.5). Averaged on the GPU workers that hold reference `ref`. Returns finalize()'s dict."""
-        from .average import finalize, halves_for
+        from .average import finalize, halves_for, new_state
         T = np.real(np.asarray(table))
         rows = T[T[:, 2] == 1]
         if len(rows) == 0:
             raise FatalIterationError("no particle with col 3 == 1 for averaging")
+        if len(rows) == 1:                    # genericInput2Average.m:292-294: one tag -> no fsc, a different path
+            raise NotImplementedError("averaging a single particle (dynamo_average without the even/odd FSC) is not "
+                                      "ported")
         bad = set(np.unique(rows[:, 12]).astype(int).tolist()) - {0, 1, 2}
         if bad:
             raise NotImplementedError("wedge types %s in averaging" % sorted(bad))
-        half = halves_for(rows)
+        rows = rows[np.argsort(rows[:, 0], kind="stable")]            # intersect(): ascending tags (05 3.2)
+        half = halves_for(rows)                                        # odd = tags(1:2:end), even = tags(2:2:end)
+        nh = np.bincount(half, minlength=2).astype(np.float64)
         mask = dynio.read_em(self.p("settings", "mask.em"))
         n = mask.shape[0]
         self._start_workers()
-        res = self._ask_all([{"op": "average", "rows": rows, "half": half, "mask": mask.astype(np.float32),
-                              "slot": ref} for _ in self.workers])
-        covered = np.concatenate([np.asarray(r["tags"], dtype=np.int64) for r in res])
-        if len(covered) != len(rows) or not np.array_equal(np.sort(covered), np.sort(rows[:, 0].astype(np.int64))):
+        held = self._ask_all([{"op": "tags", "slot": ref} for _ in self.workers])
+        owner = {}
+        for w, r in enumerate(held):
+            for t in np.asarray(r["tags"], dtype=np.int64).tolist():
+                owner.setdefault(t, w)
+        tags = rows[:, 0].astype(np.int64)
+        if any(int(t) not in owner for t in tags):
             raise RuntimeError("averaging tags are not all resident on the GPU workers")
-        return finalize([r["partial"] for r in res if r["partial"] is not None], mask, n, fmin=3.0, sym=fsc_sym)
+        # runs of consecutive tags held by the same worker; the state goes through them in order (one serial sum
+        # per half, as dynamo_average's single-thread loop)
+        w_of = np.array([owner[int(t)] for t in tags])
+        cuts = np.flatnonzero(np.diff(w_of)) + 1
+        state = new_state(n)
+        for a, b in zip(np.r_[0, cuts], np.r_[cuts, len(rows)]):
+            dev, conn, _ = self.workers[int(w_of[a])]
+            conn.send({"op": "average", "rows": rows[a:b], "half": half[a:b], "nh": nh,
+                       "mask": mask.astype(np.float32), "state": state, "slot": ref})
+            r = conn.recv()
+            if not r.get("ok"):
+                raise RuntimeError("GPU worker on device %d failed:\n%s" % (dev, r.get("error")))
+            state = r["state"]
+        return finalize(state, nh, mask, n, fmin=3.0, sym=fsc_sym)
 
     def average(self, ite, ref):
         """dpkproject.pipeline.average (06b 7): table = the refined_table TEXT after thresholding, tags col3 == 1,

@@ -7,7 +7,6 @@ HTML view makes), compared with the same fixtures of Dynamo 1.1.514's own window
 import json
 import os
 import subprocess
-import sys
 import urllib.error
 import urllib.request
 from http.cookiejar import CookieJar

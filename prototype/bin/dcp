@@ -1,7 +1,10 @@
 #!/bin/bash
-# pydyn `dcp`: the Dynamo 1.1.514 project manager (pydyn/webui; dcp --help). Usage: dcp [NAME [-option value ...]]
-# Same as .envs/pydynamo/bin/dcp (pip install -e .): pydyn.cli.dcp_main, which also restarts itself in a clean
-# environment (no PYTHONPATH / LD_LIBRARY_PATH from SBGrid / 4d / conda). DISPLAY is kept.
+# pydyn `dcp`: the dcp window, Dynamo 1.1.514's project manager (pydyn.webui; dcp --help).
+# Usage: dcp [NAME [-option value ...]]
+# Same as the console script .envs/pydynamo/bin/dcp (pydyn.cli.dcp_main), but it does not need 'pip install -e': the
+# repository's prototype folder is put on sys.path. It starts the env's python with -I and without PYTHONPATH,
+# PYTHONHOME, PYTHONSTARTUP, PYTHONUSERBASE, LD_LIBRARY_PATH and LD_PRELOAD, so settings of the login shell (a module
+# system, conda, another Qt 6 or CUDA) cannot leak in. DISPLAY is kept.
 HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 PY="$(cd "$HERE/.." && pwd)/.envs/pydynamo/bin/python"
 exec env -u PYTHONPATH -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONUSERBASE -u LD_LIBRARY_PATH -u LD_PRELOAD \

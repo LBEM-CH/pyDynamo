@@ -1,7 +1,7 @@
 """Re-execute a Dynamo 1.1.514 dcp alignment project (standalone_gpu) with pydyn, without MATLAB.
 
 python run_dynamo_project.py --source <dynamo project folder> --data <data folder> --out <new project root>
-                             [--gpus 0,1,2,3] [--iterations N] [--matlab-trig] [--keep-temp] [--table-initial F]
+                             [--gpus 0,1,2,3] [--iterations N] [--keep-temp] [--table-initial F]
                              [--engine exact|fast] [--exact-sms N] [--report PATH] [--progress-log PATH]
 
 --source      an unfolded Dynamo project (its settings/ folder, incl. settings/virtual_project.mat, is read;
@@ -13,7 +13,6 @@ python run_dynamo_project.py --source <dynamo project folder> --data <data folde
 --gpus        physical devices to run on (default: the project's gpu_identifier_set). The GPU chunks and their
               file names always follow the project's gpu_identifier_set, as in Dynamo.
 --iterations  stop after this global iteration (default: all iterations of the project)
---matlab-trig use MATLAB R2019a's sin/cos (MCR libmwmathutil) for table columns 27-30 (verification only)
 --engine      exact (default; Dynamo 1.1.514's own kernels, needs its engine binary and the CUDA 8 libraries) or fast
 --exact-sms   exact engine: reproduce the cuBLAS 8 reduction order of a GPU with this many SMs
 --report      opt-in JSON diagnostics ($PYDYN_REPORT); refused inside --out
@@ -38,7 +37,6 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--gpus", default=None)
     ap.add_argument("--iterations", type=int, default=None)
-    ap.add_argument("--matlab-trig", action="store_true")
     ap.add_argument("--keep-temp", action="store_true")
     ap.add_argument("--table-initial", default=None)
     ap.add_argument("--engine", choices=("exact", "fast"), default=None,
@@ -53,7 +51,7 @@ def main(argv=None):
     preflight(a.engine)                                   # before any project work (review M1)
     from pydyn.dynproject import DynamoProject
     gpus = [int(g) for g in a.gpus.split(",")] if a.gpus else None
-    pr = DynamoProject(a.source, a.data, a.out, gpus=gpus, matlab_trig=a.matlab_trig, keep_temp=a.keep_temp,
+    pr = DynamoProject(a.source, a.data, a.out, gpus=gpus, keep_temp=a.keep_temp,
                        table_initial=a.table_initial, engine=a.engine, exact_sms=a.exact_sms, report=a.report,
                        progress_log=a.progress_log)
     rep = pr.run(iterations=a.iterations)

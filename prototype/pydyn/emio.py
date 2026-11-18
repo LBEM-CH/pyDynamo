@@ -6,6 +6,8 @@ Data follow with x fastest (MATLAB first index).
 Arrays returned here are numpy arrays indexed [z, y, x] (C order), so arr.ravel() matches
 Dynamo's linear index x + nx*(y + ny*z).
 """
+import os
+
 import numpy as np
 
 _EM_TYPES = {1: np.int8, 2: np.int16, 4: np.int32, 5: np.float32, 8: np.complex64, 9: np.float64}
@@ -21,6 +23,29 @@ def read_em(path):
     count = int(nx) * int(ny) * int(nz)
     data = np.frombuffer(buf, dtype=dt, count=count, offset=512)
     return data.reshape(int(nz), int(ny), int(nx))
+
+
+def read_threads(most=8):
+    """Threads that read particle files for the averaging: up to `most`, never more than the CPUs this process may
+    use (in a Slurm job, the job's --cpus-per-task; os.sched_getaffinity). The order of the results does not
+    depend on it (they are taken in list order)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    return max(1, min(most, n))
+
+
+def read_em_stack(paths, threads=None):
+    """[len(paths), ...] float32 stack of read_em(p) in list order. The files are read by a few threads at once
+    (network file systems are latency-bound one file at a time); the bytes and the order are those of a serial read."""
+    from concurrent.futures import ThreadPoolExecutor
+    paths = list(paths)
+    threads = read_threads() if threads is None else threads
+    if len(paths) < 2 or threads <= 1:
+        return np.stack([read_em(p).astype(np.float32) for p in paths])
+    with ThreadPoolExecutor(max_workers=min(threads, len(paths))) as ex:
+        return np.stack(list(ex.map(lambda p: read_em(p).astype(np.float32), paths)))
 
 
 def write_em(path, arr_zyx):

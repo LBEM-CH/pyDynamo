@@ -1,4 +1,4 @@
-"""The dcp GUI: controller (pydyn.dcpcontrol, no display needed) and the Tk view's entry points (pydyn.gui).
+"""The dcp GUI: controller (pydyn.dcpcontrol, no display needed) and the dcp command's entry point.
 
 The controller is compared with Dynamo 1.1.514's own dcp windows, driven headless in run G
 (benchmarks/04_journey_bin8_align_1/dynamo/gui, script scripts/g_gui_journey.m). Window states, the rounds tables, the mask files
@@ -27,7 +27,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, "fixtures", "stage3", "gui")
 P = os.path.abspath(os.path.join(HERE, "..", ".."))
 SRC = "/programs/x86_64-linux/dynamo/1.1.514/matlab/src"
-GT = os.path.join(P, "benchmarks", "04_journey_bin8_align_1", "dynamo", "gui")
 BUTTONS = [("pushbutton_data", "data"), ("pushbutton_table", "table"), ("pushbutton_template", "template"),
            ("pushbutton_masks", "masks"), ("pushbutton_settings", "settings"), ("pushbutton_hardware", "destination"),
            ("pushbutton_check", "check"), ("pushbutton_unfold", "unfold"), ("pushbutton_run", "run")]
@@ -78,7 +77,7 @@ def test_format_str():
 
 
 def test_ellipsoid_default_is_dynamo_default_mask():
-    from pydyn.project import default_mask
+    from pydyn.masks import default_mask
     assert np.array_equal(ellipsoid(31, [64, 64, 64]), default_mask(64))
     assert np.array_equal(ellipsoid([31, 31, 31], 64), default_mask(64))
     assert not ellipsoid(0, 8).any()
@@ -275,20 +274,7 @@ def test_template_average_cpu(tmp_path, monkeypatch):
     assert V.load("g1")["file_template_initial"] == "g1/settings/computedAverage.em"
 
 
-# ---------------------------------------------------------------------------------------------------- Tk view
-def test_gui_without_display(monkeypatch, capsys, tmp_path):
-    import pydyn.gui as gui
-    monkeypatch.delenv("DISPLAY", raising=False)
-    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-    assert gui.display_problem() is not None
-    assert gui.main([]) == 2
-    assert "no X display" in capsys.readouterr().out
-    assert gui.open_project("x") is None
-    monkeypatch.chdir(tmp_path)
-    assert gui.main(["missing_project"]) == 1
-    assert "Project NOT in disk" in capsys.readouterr().out
-
-
+# ---------------------------------------------------------------------------------------------------- dcp command
 def test_dcp_command_without_display(tmp_path):
     """prototype/bin/dcp (and the installed `dcp`) start, restart in a clean environment and stop cleanly."""
     env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
@@ -298,67 +284,6 @@ def test_dcp_command_without_display(tmp_path):
     r = subprocess.run([os.path.join(P, "prototype", "bin", "dcp")], cwd=str(tmp_path), env=env,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 2 and "no X display" in r.stdout, (r.stdout, r.stderr)
-
-
-def test_tk_mask_editor_and_multireference_menu(tmp_path, monkeypatch):
-    """The Tk view on a virtual X display (Xvnc/Xvfb; skipped without DISPLAY): masks window -> mask editor ->
-    save -> Enter in the mask box; Multireference > Adaptive filtering > Derive a project; project box p1_eo; Edit
-    parameters for Adaptive Filtering run (0.143 / 25 / 0)."""
-    if not os.environ.get("DISPLAY"):
-        pytest.skip("no X display")
-    tk = pytest.importorskip("tkinter")
-    from pydyn import gui, masks
-    monkeypatch.chdir(tmp_path)
-    make_data(str(tmp_path), N=4)
-    from pydyn.dcptool import dcp
-    dcp.new("p1", "d", "filamentsData_ctf", "template", "raw_template_ctf.em", "masks", "default", "t",
-            "particles_edit_mod.tbl", "gui", 0)
-    root = tk.Tk()
-    try:
-        app = gui.DcpApp(root, "p1")
-        assert app.c.name == "p1" and app.v_nref.get() == "1"
-        app.win_masks()
-        mw = app.windows["masks"]
-        editor_buttons = [w for w in mw.winfo_children()[0].winfo_children()
-                          if isinstance(w, tk.ttk.LabelFrame) and w.cget("text") == "generate"][0]
-        b = [w for w in editor_buttons.winfo_children() if isinstance(w, tk.ttk.Button)
-             and w.cget("text") == "mask editor"][0]
-        b.invoke()
-        v = app.mask_editor_vars
-        assert v["size"].get() == "64  64  64" and v["save"].get() == "p1/settings/editorMask.em"
-        assert app.mask_rows["mask"][0].get() == "p1/settings/editorMask.em"
-        v["type"].set("cylinder")
-        for p, s in (("r", "15"), ("height", "30"), ("gaussian", "3")):
-            v["radio"][p].set(True)
-            v["edit"][p].set(s)
-        app.windows["mask_editor"].mask_editor_save()
-        assert os.path.isfile("p1/settings/editorMask.em")
-        if masks.fft_backend() != "scipy":
-            assert md5("p1/settings/editorMask.em") == "90f4bb01a9f2fc670bd758ea3aeb58dd"
-        ent = app.mask_rows["mask"][1]
-        ent.master.grid_slaves(row=0, column=3)[0].invoke()        # the row's "enter" button (= Return)
-        assert V.load("p1")["file_mask"] == "p1/settings/editorMask.em"
-        gs = app.menus["golden_standard"]
-        assert [gs.entrycget(i, "label") for i in range(gs.index("end") + 1)] == [
-            "Derive a project.", "Edit parameters for Adaptive Filtering run"]
-        gs.invoke(1)                                     # single reference: refused with Dynamo's warning
-        assert "abp" not in app.windows
-        gs.invoke(0)
-        assert V.isproject("p1_eo")
-        app.v_project.set("p1_eo")
-        app.enter_project()
-        assert app.c.name == "p1_eo" and app.v_nref.get() == "2"
-        gs.invoke(1)
-        for n, s in (("adaptive_bandpass_threshold", "0.143"), ("adaptive_bandpass_initial", "25"),
-                     ("adaptive_bandpass_pushback", "0")):
-            var, commit = app.abp_vars[n]
-            var.set(s)
-            assert commit().ok
-        vp = V.load("p1_eo")
-        assert (vp["adaptive_bandpass_threshold"], vp["adaptive_bandpass_initial"],
-                vp["adaptive_bandpass_pushback"]) == (0.143, 25.0, 0.0)
-    finally:
-        root.destroy()
 
 
 def test_fmask_use_ones_multireference(tmp_path, monkeypatch):

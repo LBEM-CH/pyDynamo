@@ -1,12 +1,10 @@
-"""GPU tests (skipped without CuPy and a CUDA device). Run them on a GPU machine:
-python -I -m pytest -m gpu prototype/tests
+"""GPU tests, opt-in (tests/conftest.py): inside a GPU job, e.g. the Slurm sandbox,
+PYDYN_GPU_TESTS=1 python -I -m pytest -m gpu prototype/tests
 """
 import numpy as np
 import pytest
 
-from pydyn import emio
-from pydyn.angles import rotation_matrices
-from pydyn.project import default_mask
+from pydyn.masks import default_mask
 
 pytestmark = pytest.mark.gpu
 
@@ -49,51 +47,49 @@ def test_engine_recovers_known_shift():
 
 def test_rotation_kernel_identity_and_gpu_average_matches_cpu_reference():
     import cupy as cp
-    from pydyn.average import finalize, halves_for, partial_sums
+    from pydyn.average import finalize, halves_for, new_state, ordered_sums
     n = 32
     t = _blob(n)
     rows = np.zeros((4, 35), dtype=np.float32)
     rows[:, 0], rows[:, 2], rows[:, 12] = [1, 2, 3, 4], 1, 0
     parts = np.stack([t] * 4)
-    ps = partial_sums(parts, rows, halves_for(rows), default_mask(n), batch=2)
-    out = finalize([ps], default_mask(n), n)
+    half = halves_for(rows)
+    nh = np.bincount(half, minlength=2).astype(np.float64)
+    st = ordered_sums(parts, rows, half, nh, default_mask(n), new_state(n), batch=2)
+    out = finalize(st, nh, default_mask(n), n)
     assert np.corrcoef(out["average_unweighted"][:-1, :-1, :-1].ravel(), t[:-1, :-1, :-1].ravel())[0, 1] > 0.999
-    assert ps["n"].tolist() == [2, 2] and cp.cuda.runtime.getDeviceCount() > 0
+    assert out["n"] == [2, 2] and cp.cuda.runtime.getDeviceCount() > 0
 
 
-def _serial_dynamo_sums(parts, rows, half, mask):
-    """CPU reference of dynamo_average's project loop (alignParticle / extractAlignedFMask): option-4 rotation,
-    NaN -> 0, dynamo_normalize_roi in double (MATLAB mean / var), NaN -> 0, option-0 wedge rotation; double sums in
-    row order per half."""
+def _serial_dynamo_sums(parts, rows, half, mask, nh):
+    """CPU reference of dynamo_average's single-thread project loop (alignParticle / extractAlignedFMask):
+    option-4 rotation, NaN -> 0, dynamo_normalize_roi with MATLAB's sequential sums, NaN -> 0, option-0 wedge
+    rotation / Ntags; double sums in row (ascending tag) order per half."""
     from pydyn.average import mex_matrices, shift_rot_mex_cpu, wedge_mask
+    from pydyn.matlab_numerics import normalize_roi
     n = parts.shape[1]
     M, Sh = mex_matrices(rows)
-    I = np.asarray(mask).ravel() != 0
     S, C, F = np.zeros((2, n ** 3)), np.zeros((2, n ** 3)), np.zeros((2, n ** 3))
     for i in range(len(rows)):
         r = shift_rot_mex_cpu(parts[i], M[i], Sh[i]).astype(np.float64).ravel()
         nan = np.isnan(r)
         r[nan] = 0
-        iroi = r[I]
-        mu = iroi.sum() / iroi.size
-        x = iroi - mu
-        x = x - x.sum() / x.size
-        r = (r - mu) / np.sqrt((x * x).sum() / (x.size - 1))
+        r = normalize_roi(r, np.asarray(mask).ravel())
         r[nan] = 0
         w = shift_rot_mex_cpu(wedge_mask(n, rows[i]), M[i], np.zeros(3, np.float32), implicit_sphere=True,
                               outscope=0.0).astype(np.float64).ravel()
         k = int(half[i])
-        S[k] += r
-        C[k] += nan
-        F[k] += w
+        S[k] = S[k] + r
+        C[k] = C[k] + nan
+        F[k] = F[k] + w / nh[k]
     return S, C, F
 
 
 def test_project_average_kernels_are_mex_exact():
-    """partial_sums (GPU) == the serial CPU port of Dynamo's loop: identical NaN counts and rotated wedges, and S
-    equal to summation-order rounding; option-0 GPU rotation bit-equal to the CPU port."""
+    """ordered_sums (GPU) == the serial CPU port of Dynamo's single-thread loop, bit for bit (S, C, F), also when
+    the state is chained over two calls; option-0 GPU rotation bit-equal to the CPU port."""
     import cupy as cp
-    from pydyn.average import _kernel, halves_for, mex_rotation_matrix, partial_sums, shift_rot_mex_cpu
+    from pydyn.average import _mex_kernel, halves_for, mex_rotation_matrix, new_state, ordered_sums, shift_rot_mex_cpu
     n = 32
     rs = np.random.RandomState(3)
     t = _blob(n)
@@ -106,15 +102,16 @@ def test_project_average_kernels_are_mex_exact():
     parts = np.stack([np.roll(t, k, axis=2) + 0.01 * rs.standard_normal((n, n, n)).astype(np.float32)
                       for k in range(P)])
     half = halves_for(rows)
-    ps = partial_sums(parts, rows, half, default_mask(n), batch=4)
-    S, C, F = _serial_dynamo_sums(parts, rows, half, default_mask(n))
-    assert np.array_equal(ps["C"], C)
-    assert np.array_equal(ps["F"], F)
-    assert np.abs(ps["S"] - S).max() < 1e-11 * max(1.0, np.abs(S).max())
+    nh = np.bincount(half, minlength=2).astype(np.float64)
+    st = ordered_sums(parts[:4], rows[:4], half[:4], nh, default_mask(n), new_state(n), batch=3)
+    st = ordered_sums(parts[4:], rows[4:], half[4:], nh, default_mask(n), st, batch=3)
+    S, C, F = _serial_dynamo_sums(parts, rows, half, default_mask(n), nh)
+    for got, want in ((st["S"], S), (st["C"], C), (st["F"], F)):
+        assert np.array_equal(got.view(np.int64), want.view(np.int64))
     e = rows[0, 6:9].astype(np.float64)
     m = np.array(mex_rotation_matrix(*e))
     out = cp.empty((1, n, n, n), dtype=cp.float32)
-    _kernel("rot_mex0")((((n ** 3) + 255) // 256,), (256,),
+    _mex_kernel("rot_mex0")((((n ** 3) + 255) // 256,), (256,),
                         (cp.asarray(t), cp.zeros(1, dtype=cp.int64), cp.asarray(m), out, np.float32(0.0),
                          np.int32(n), np.int64(n ** 3)))
     cpu = shift_rot_mex_cpu(t, m, np.zeros(3, np.float32), implicit_sphere=True, outscope=0.0)

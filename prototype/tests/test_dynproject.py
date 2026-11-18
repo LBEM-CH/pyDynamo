@@ -64,17 +64,12 @@ def test_round_array_leaders_and_ite2round():
     assert dp._last_leader_before(base_vpr(2), 3) == 1      # strict '<': a round leader gets the previous leader
 
 
-def test_convention_lists_match_dynamo_source():
-    src = os.path.join(dp.DYNAMO_SRC, "dynamo_vpr_convention.m")
-    if not os.path.exists(src):
-        pytest.skip("Dynamo 1.1.514 source not available")
-    import re
-    nc, rc = [], []
-    for ln in open(src).read().splitlines():
-        m = re.match(r"^\s*(nc|rc)\{c\}\.name\s*=\s*'([^']*)'\s*;", ln.split("%")[0])
-        if m:
-            (nc if m.group(1) == "nc" else rc).append(m.group(2))
-    assert nc == dp.GLOBAL_PARAMS and rc == dp.ROUND_PARAMS
+def test_convention_lists_match_the_generated_convention_table():
+    """dynproject's parameter lists equal pydyn.convention (generated from dynamo_vpr_convention.m; the re-parse of
+    the source itself is tests/test_stage3.py::test_convention_table_matches_source)."""
+    from pydyn import convention
+    assert dp.GLOBAL_PARAMS == [p["name"] for p in convention.NC]
+    assert dp.ROUND_PARAMS == [p["name"] for p in convention.RC]
 
 
 def test_validate_rejects_unsupported(tmp_path):
@@ -105,7 +100,7 @@ def test_acos_branches_and_self_comparison():
     t[:, 3:6] = rng.normal(size=(50, 3))
     t[:, 6:9] = rng.uniform(-180, 180, size=(50, 3))
     t[:, 9] = rng.uniform(size=50)
-    c27, c28, c29, c30 = dp.compare_columns(t, t, dp.NumpyTrig)
+    c27, c28, c29, c30 = dp.compare_columns(t, t, dp.FdlibmTrig)
     assert not c27.any() and not c29.any() and not c30.any()
     assert np.all(np.abs(c28) < 1e-5)                 # rounding artefact only
 
@@ -116,7 +111,7 @@ def test_compare_columns_values():
     cur[0, 3:6] = [3, 4, 0]
     cur[0, 6:10] = [102.46, 170.14, 80.936, 0.09848]
     prev[0, 6:9] = [90, 0, 0]
-    c27, c28, c29, c30 = dp.compare_columns(cur, prev, dp.NumpyTrig)
+    c27, c28, c29, c30 = dp.compare_columns(cur, prev, dp.FdlibmTrig)
     assert c27[0] == 5 and dynio.dlm_field(c29[0]) == "12.46" and c30[0] == 0.09848
     assert dynio.dlm_field(c28[0]) == "170.14"        # angle between the z axes = tilt difference
 
@@ -216,8 +211,8 @@ def test_card_ite_from_vpr_matches_run():
         assert mine == _strip_times(run), k
 
 
-def _project(tmp_path, matlab_trig=False):
-    pr = dp.DynamoProject(RUN, DATA, str(tmp_path / "proj"), matlab_trig=matlab_trig, echo=False)
+def _project(tmp_path):
+    pr = dp.DynamoProject(RUN, DATA, str(tmp_path / "proj"), echo=False)
     os.makedirs(pr.p("settings"), exist_ok=True)
     for f in os.listdir(os.path.join(RUN, "settings")):
         shutil.copyfile(os.path.join(RUN, "settings", f), pr.p("settings", f))
@@ -275,25 +270,13 @@ def test_setup_reproduces_run(tmp_path, k):
     assert np.array_equal(b3, S[7068:].astype(np.float32).astype(np.float64))
 
 
-def _matlab_trig_available():
-    try:
-        dp.MatlabTrig()
-        return True
-    except OSError:
-        return False
-
-
 @have_run
-@pytest.mark.parametrize("trig", ["matlab", "numpy"])
 @pytest.mark.parametrize("k", [1, 2, 3, 4])
-def test_assemble_tables_reproduce_run_refined_table(tmp_path, k, trig):
+def test_assemble_tables_reproduce_run_refined_table(tmp_path, k):
     """Gather + columns 27-30 + thresholding on per-GPU float32 tables equal to what the engine produced
-    (starting table of the run with its columns 4-10 from the run's refined table): the refined_table must be
-    byte-identical with MATLAB's sin/cos; with numpy's, every column except 28 must be."""
-    mt = trig == "matlab"
-    if mt and not _matlab_trig_available():
-        pytest.skip("MCR libmwmathutil not available")
-    pr = _project(tmp_path, matlab_trig=mt)
+    (starting table of the run with its columns 4-10 from the run's refined table): the refined_table is
+    byte-identical (MATLAB's sin/cos/acos through pydyn.fdlibm)."""
+    pr = _project(tmp_path)
     S = dynio.read_tbl(_run_file(k, "starting_table_ref_001_ite_%04d.tbl" % k))
     R = dynio.read_tbl(_run_file(k, "refined_table_ref_001_ite_%04d.tbl" % k))
     eng = np.real(S).copy()
@@ -314,7 +297,44 @@ def test_assemble_tables_reproduce_run_refined_table(tmp_path, k, trig):
             if x != y:
                 bad[j + 1] = bad.get(j + 1, 0) + 1
     assert info["contributors"] == 9422
-    if mt:
-        assert not bad, bad
-    else:
-        assert set(bad) <= {28}, bad
+    assert not bad, bad
+
+
+def test_average_chains_one_state_through_the_workers_in_ascending_tag_order(monkeypatch):
+    """average_from_table: rows sorted by tag, odd/even by position, and one running state sent to the workers' runs
+    of consecutive tags in that order (dynamo_average's single-thread loop), then finalize on the last state."""
+    import pydyn.average as AV
+    n = 4
+    held = {0: [5, 7, 9, 40], 1: [11, 12, 2], 2: [30, 31]}             # tags resident on three workers
+
+    class Conn:
+        def __init__(self, w):
+            self.w, self.out = w, None
+        def send(self, m):
+            if m["op"] == "tags":
+                self.out = {"ok": True, "tags": np.array(held[self.w])}
+            else:
+                calls.append((self.w, m["rows"][:, 0].astype(int).tolist(), m["half"].tolist(), m["state"]["k"]))
+                st = dict(m["state"]); st["k"] = m["state"]["k"] + 1
+                self.out = {"ok": True, "state": st}
+        def recv(self):
+            return self.out
+
+    calls = []
+    pr = object.__new__(dp.DynamoProject)
+    pr.workers = [(d, Conn(d), None) for d in range(3)]
+    pr._start_workers = lambda: None
+    pr.p = lambda *a: "mask.em"
+    monkeypatch.setattr(dp.dynio, "read_em", lambda f: np.ones((n, n, n), np.float32))
+    monkeypatch.setattr(AV, "new_state", lambda n: {"k": 0})
+    monkeypatch.setattr(AV, "finalize", lambda state, nh, mask, n, fmin, sym: (state, nh.tolist()))
+    tags = [40, 2, 31, 5, 12, 9, 30, 7, 11]
+    T = np.zeros((len(tags), 35))
+    T[:, 0], T[:, 2] = tags, 1
+    state, nh = pr.average_from_table(1, 1, T)
+    # ascending: 2 5 7 9 11 12 30 31 40 -> runs by owner: [2](1) [5 7 9](0) [11 12](1) [30 31](2) [40](0)
+    assert [c[0] for c in calls] == [1, 0, 1, 2, 0]
+    assert [c[1] for c in calls] == [[2], [5, 7, 9], [11, 12], [30, 31], [40]]
+    assert sum((c[2] for c in calls), []) == [0, 1, 0, 1, 0, 1, 0, 1, 0]      # odd/even by position
+    assert [c[3] for c in calls] == [0, 1, 2, 3, 4] and state["k"] == 5      # each run gets the previous state
+    assert nh == [5.0, 4.0]

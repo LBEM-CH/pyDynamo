@@ -19,7 +19,7 @@ def _bars(n=80):
     print("-" * n)
 
 
-def execute_project(name, gpus=None, destination=None, matlab_trig=False, keep_temp=False, iterations=None,
+def execute_project(name, gpus=None, destination=None, keep_temp=False, iterations=None,
                     engine=None, exact_sms=None, report=None):
     """dynamo_execute_project(name): run the unfolded project ./<name> from the current folder.
     gpus: physical device ids to use (default: the vpr's gpu_identifier_set), or "all": every visible GPU, up to
@@ -99,7 +99,7 @@ def execute_project(name, gpus=None, destination=None, matlab_trig=False, keep_t
                            % vpr["name_project"])
     data = vpr["folder_data"]
     data = data if os.path.isabs(data) else os.path.abspath(data)
-    pr = DynamoProject(root, data, root, gpus=ids, matlab_trig=matlab_trig, keep_temp=keep_temp, engine=engine,
+    pr = DynamoProject(root, data, root, gpus=ids, keep_temp=keep_temp, engine=engine,
                        exact_sms=exact_sms, report=report)
     pr.run(iterations=iterations)
     return True

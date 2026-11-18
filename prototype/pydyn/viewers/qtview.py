@@ -1,5 +1,5 @@
 """Qt (PySide6) windows of the viewers. They only paint what pydyn.viewers.logic computes and forward the user's
-actions to it. This module is imported only in the viewer process (python -m pydyn.viewers ...), never in the Tk dcp
+actions to it. This module is imported only in the viewer process (python -m pydyn.viewers ...), never in the dcp window's
 process. Layouts follow Dynamo 1.1.514's windows (docs/analysis/11a_viewers_1.1.514.md; screenshots of the real
 windows in benchmarks/08_viewers/dynamo_screens/)."""
 import math
@@ -687,11 +687,6 @@ class DviewWindow(QtWidgets.QMainWindow):
         c.zoom_mode = "in" if self.act_zoom_in.isChecked() else "out" if self.act_zoom_out.isChecked() else None
         c.pan_mode = self.act_pan.isChecked()
         c.update_cursor()
-
-    def _zoom(self, f):
-        """Zoom about the centre of the window (keyboard / scripts)."""
-        c = self.canvas
-        c.zoom_at(QtCore.QPointF(c.width() / 2.0, c.height() / 2.0), f)
 
     def _contrast(self):
         """dynamo_imcontrast (dynamo__imcontrast.m): histogram of the montage CData; the limits act on CLim."""

@@ -33,7 +33,7 @@ def worker(args):
     with open(card.particle_list(gpu)) as f:
         paths = [ln.strip() for ln in f if len(ln.strip()) > 4]
     rows = emio.read_btbl(card.starting_table(gpu))[: len(paths)]
-    particles = np.stack([emio.read_em(p).astype(np.float32) for p in paths])
+    particles = emio.read_em_stack(paths)
     template = emio.read_em(card.file_template).astype(np.float32)
     mask = emio.read_em(card.file_mask).astype(np.float32)
     t_io = time.perf_counter() - t1
@@ -54,7 +54,7 @@ def worker(args):
             "t_import_s": round(t_import, 3), "t_read_s": round(t_io, 3),
             "t_prepare_s": round(eng.timings.get("prepare_particles", 0), 3),
             "t_refine_s": round(t_refine, 3), "t_angles_s": round(eng.timings.get("angles", 0), 3),
-            "t_align_s": round(eng.timings.get("align", 0), 3),
+            "t_align_s": round(eng.timings.get("align", 0), 3), "exact_host": eng.timings.get("exact_host"),
             "worker_wall_s": round(time.perf_counter() - t0, 3), "pool_bytes": int(peak),
             "balancer": eng.balance_log, "residency": eng.residency, "out": out}
 

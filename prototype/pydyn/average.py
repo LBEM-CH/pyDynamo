@@ -1,13 +1,15 @@
 """GPU re-implementation of Dynamo's pipeline average (docs/analysis/05_averaging_assembly.md sections 3-4).
 
-Per GPU, `partial_sums` brings each of its particles into the reference frame and accumulates, per half (odd/even
-by position in the ascending tag list):
+`ordered_sums` brings particles into the reference frame and adds them, in ascending tag order, to the running sums
+of their half (odd/even by position in the ascending tag list):
 * S = sum of mask-normalized particles;
 * C = number of NaN contributions per voxel;
-* F = sum of rotated wedges;
-* n = number of particles.
-`finalize` merges the per-GPU sums and computes the outputs Dynamo writes: average, average_unweighted,
-fweight_average_raw, fmask_average and eo_fsc.
+* F = sum of rotated wedges / Ntags.
+The project runner chains one state through its GPU workers in tag order, so each half is one sequential double
+sum as in dynamo_average's single-thread MATLAB loop (Dynamo's executables run -singleCompThread); the per-particle
+normalisation uses MATLAB's sequential sums (pydyn.matlab_numerics), and the FFTs are MATLAB's FFTW. Checked byte
+for byte against the user's Dynamo averages (benchmarks/12_avg_order). `finalize` computes the outputs Dynamo
+writes: average, average_unweighted, fweight_average_raw, fmask_average and eo_fsc.
 
 Rotations follow dynamo_shift_rot_mex exactly (08b 4.4; mex/src/classes/volume_float.cpp:416-620): the particle with
 masking option 4 (sharpShiftRot, NaN outside the box, dynamo_average.m:2663-2665), the wedge with option 0
@@ -26,23 +28,8 @@ except ImportError:                     # CPU-only environments: finalize() and 
     cp = None
 
 from . import angles as A
-from .balancer import MemoryBalancer
-
-
-def read_threads(most=8):
-    """Threads that read particle files for the averaging: up to `most`, never more than the CPUs this process may
-    use (in a Slurm job, the job's --cpus-per-task; os.sched_getaffinity). The order of the sums does not depend on
-    it (results are taken in particle order)."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        n = os.cpu_count() or 1
-    return max(1, min(most, n))
-
-
-def _kernel(name):
-    """Compiled kernel of the mex-exact sources below (_MEX_SRC, compiled with --fmad=false)."""
-    return _mex_kernel(name)
+from .emio import read_threads  # noqa: F401  (the console daverage path and tests use it from here)
+from . import matlab_numerics as MN
 
 
 def _fill_wedge(n, theta_min, theta_max, eulers):
@@ -85,13 +72,6 @@ def wedge_mask(n, row):
     raise NotImplementedError(f"ftype {ftype} not supported by the prototype averaging")
 
 
-def inverse_matrices(rows):
-    """Float32 matrices of e = -ptable(9:-1:7), i.e. M(tdrot,tilt,narot)^T (pydyn.angles). Not used for the
-    averaging rotation any more (see mex_matrices)."""
-    e = -rows[:, [8, 7, 6]].astype(np.float32)
-    return A.rotation_matrices(e)
-
-
 def mex_matrices(rows):
     """Double matrices and float32 shifts of dynamo_shift_rot(p, -ptable(4:6), -ptable(9:-1:7)) for every row, as
     dynamo_shift_rot_mex builds them (sharp_shift_rot_params, 08b 4.4)."""
@@ -101,146 +81,111 @@ def mex_matrices(rows):
     return M, S
 
 
-def _normalize_roi_rows(V, idx, cnt):
-    """dynamo_normalize_roi_one (dynamo_normalize_roi.m) on each row of V (float64 [B, N], NaN already set to 0, so
-    ind_valid_points = find(mask)): miroi = mean(iroi); stdiroi = std(iroi - miroi), with MATLAB's var (centre on
-    its own mean, divide by n-1); particle = (particle - mean(iroi)) ./ stdiroi. In double."""
-    iroi = V[:, idx]
-    mu = iroi.sum(axis=1) / cnt
-    x = iroi - mu[:, None]
-    x = x - (x.sum(axis=1) / cnt)[:, None]
-    sd = cp.sqrt((x * x).sum(axis=1) / (cnt - 1))
-    del iroi, x
-    return (V - mu[:, None]) / sd[:, None]
+def new_state(n):
+    """Running sums of both halves (odd = 0, even = 1): S = sum of normalised particles, C = NaN counts,
+    F = sum of rotated wedges / Ntags; float64 [2, n^3] each, all zero (totalFmask = zeros, dynamo_average.m:2160;
+    average_raw starts from the first particle, and 0 + r = r)."""
+    N = n ** 3
+    return {"S": np.zeros((2, N)), "C": np.zeros((2, N)), "F": np.zeros((2, N))}
 
 
-def partial_sums(particles, rows, half, mask, batch="auto", balance_log=None):
-    """Per-GPU part of the average. particles [P,n,n,n] float32 (host or device); rows [P, cols] table rows;
-    half[P] in {0 (odd), 1 (even)}. Returns dict with float64 host arrays S[2], C[2], F[2] and counts n[2].
-
-    Per particle (dynamo_average.m alignParticle :2647-2681, extractAlignedFMask :2690-2697):
-      r = sharpShiftRot(p, -t(4:6), -t(9:-1:7))     mex option 4, float result returned as double
-      nanmap = isnan(r); r(nanmap) = 0; r = normalize_roi(r, nmask = raw mask != 0); r(nanmap) = 0
-      w = dynamo_rot(wedge, -t(9:-1:7))              mex option 0, outscope 0
-    and S += r, C += nanmap, F += w in double."""
+def ordered_sums(particles, rows, half, nh, mask, state, batch=None):
+    """Add particles to the running sums of their half, in the order given, as dynamo_average does in single-thread
+    MATLAB (dynamo_average.m alignParticle :2647-2681, main loop :1974-1997, weight loop :2167-2187):
+      r = sharpShiftRot(p, -t(4:6), -t(9:-1:7))     mex option 4 (NaN outside the box)
+      nanmap = isnan(r); r(nanmap) = 0; r = dynamo_normalize_roi(r, mask); r(nanmap) = 0
+      S += r; C += nanmap; F += dynamo_rot(wedge, -t(9:-1:7)) / Ntags
+    The caller passes the particles in ascending tag order (intersect() in dynamo_average.m:1301) and chains the
+    state through every GPU worker in that order, so each half is one sequential sum as in Dynamo.
+    particles [P, n, n, n] float32 (host or device); rows [P, cols]; half[P] in {0, 1}; nh = (Ntags_odd,
+    Ntags_even) of the whole average; mask: the project mask (find(mask) = voxels != 0). Returns the new state."""
     t0 = time.perf_counter()
     P, n = len(rows), particles.shape[1]
     N = n ** 3
     idx = cp.asarray(np.flatnonzero(np.asarray(mask).ravel() != 0))
-    cnt = float(idx.size)
+    nvox = int(idx.size)
     keys, widx = {}, np.zeros(P, dtype=np.int64)
     for p in range(P):
         key = (int(rows[p, 12]),) + tuple(float(x) for x in rows[p, 13:19])
-        if key not in keys:
-            keys[key] = len(keys)
-        widx[p] = keys[key]
-    Wstack = cp.asarray(np.stack([wedge_mask(n, np.array([0] * 12 + list(k) + [0] * 16, dtype=np.float32)) for k in keys]))
+        widx[p] = keys.setdefault(key, len(keys))
+    Wstack = cp.asarray(np.stack([wedge_mask(n, np.array([0] * 12 + list(k) + [0] * 16, dtype=np.float32)) for k in keys])) \
+        if P else None
     mats, shifts = mex_matrices(rows)
-    S = cp.zeros((2, N), dtype=cp.float64)
-    C = cp.zeros((2, N), dtype=cp.float64)
-    F = cp.zeros((2, N), dtype=cp.float64)
-    counts = np.bincount(np.asarray(half, dtype=np.int64), minlength=2)
-    half_d = cp.asarray(np.asarray(half, dtype=np.int64))
-
-    def run(b0, b1):
+    S, C, F = (cp.asarray(state[k]) for k in ("S", "C", "F"))
+    nh_d = cp.asarray(np.asarray(nh, dtype=np.float64))
+    half = np.asarray(half, dtype=np.int32)
+    kr, kw, km, ka = (_mex_kernel(k) for k in ("shiftrot_mex4", "rot_mex0", "roi_moments", "accum_ordered"))
+    if batch is None:                                   # from free GPU memory; the sums' order does not depend on it
+        per = 4 * N * 4 + nvox * (4 + 8 + 8)            # in/out/wedge float32 [B, N], gathered ROI float32/64 + transpose
+        free = cp.cuda.Device().mem_info[0] + cp.get_default_memory_pool().free_bytes()
+        batch = max(1, min(256, int(0.5 * free) // per))
+    for b0 in range(0, P, int(batch)):
+        b1 = min(P, b0 + int(batch))
         B = b1 - b0
-        vin = cp.asarray(particles[b0:b1], dtype=cp.float32)
         M = cp.asarray(mats[b0:b1].ravel())
         out = cp.empty((B, n, n, n), dtype=cp.float32)
-        _kernel("shiftrot_mex4")(((B * N + 255) // 256,), (256,),
-                                 (vin, M, cp.asarray(shifts[b0:b1].ravel()), out, np.int32(n), np.int64(B * N)))
-        del vin
-        V = out.reshape(B, N).astype(cp.float64)
-        del out
-        nan = cp.isnan(V)
-        V[nan] = 0
-        Vn = _normalize_roi_rows(V, idx, cnt)
-        del V
-        Vn[nan] = 0
+        kr(((B * N + 255) // 256,), (256,), (cp.asarray(particles[b0:b1], dtype=cp.float32), M,
+                                             cp.asarray(shifts[b0:b1].ravel()), out, np.int32(n), np.int64(B * N)))
+        V = out.reshape(B, N)
+        X = cp.nan_to_num(V[:, idx].astype(cp.float64), copy=False, nan=0.0).T.copy()   # [nvox, B], r(nanmap) = 0
+        mu, sd = cp.empty(B, cp.float64), cp.empty(B, cp.float64)
+        km(((B + 127) // 128,), (128,), (X, np.int32(B), np.int64(nvox), mu, sd))
+        del X
         R = cp.empty((B, n, n, n), dtype=cp.float32)
-        _kernel("rot_mex0")(((B * N + 255) // 256,), (256,),
-                            (Wstack, cp.asarray(widx[b0:b1]), M, R, np.float32(0.0), np.int32(n), np.int64(B * N)))
-        R = R.reshape(B, N)
-        h = half_d[b0:b1]
-        for k in (0, 1):
-            sel = h == k
-            if bool(sel.any()):
-                S[k] += Vn[sel].sum(axis=0)
-                C[k] += nan[sel].sum(axis=0, dtype=cp.float64)
-                F[k] += R[sel].astype(cp.float64).sum(axis=0)
-
-    if batch == "auto":
-        bal = MemoryBalancer(log=balance_log if balance_log is not None else [])
-        # calibration runs probe batches through run(); restore the accumulators afterwards
-        S0, C0, F0 = S.copy(), C.copy(), F.copy()
-        bal.calibrate(run, P)
-        S[...] = S0; C[...] = C0; F[...] = F0
-        del S0, C0, F0
-        bal.run_all(run, P)
-    else:
-        for b0 in range(0, P, int(batch)):
-            run(b0, min(P, b0 + int(batch)))
+        kw(((B * N + 255) // 256,), (256,), (Wstack, cp.asarray(widx[b0:b1]), M, R, np.float32(0.0), np.int32(n),
+                                             np.int64(B * N)))
+        ka(((N + 255) // 256,), (256,), (V, R.reshape(B, N), mu, sd, cp.asarray(half[b0:b1]), nh_d, np.int32(B),
+                                         np.int64(N), S, C, F))
+        del out, R
     cp.cuda.Device().synchronize()
-    return {"S": S.get(), "C": C.get(), "F": F.get(), "n": counts, "seconds": time.perf_counter() - t0}
+    return {"S": S.get(), "C": C.get(), "F": F.get(), "seconds": time.perf_counter() - t0}
 
 
 def normalize_roi(v, mask):
-    I = (mask != 0) & ~np.isnan(v)
-    mu = v[I].mean()
-    sd = np.std(v[I] - mu, ddof=1)
-    return (v - mu) / sd
+    """dynamo_normalize_roi(v, mask) in single-thread MATLAB (pydyn.matlab_numerics)."""
+    return MN.normalize_roi(v, mask)
 
 
 def fweight_divide(v, F, tau):
-    v = v.copy()
-    if np.isnan(v).any():
-        v[np.isnan(v)] = np.nanmean(v)
-    bad = (F < tau) | np.isnan(F)
-    F2 = F.copy()
-    F2[bad] = 1
-    V = np.fft.fftshift(np.fft.fftn(v))
-    V[bad] = 0
-    V = V / F2
-    V[bad] = 0
-    return np.real(np.fft.ifftn(np.fft.ifftshift(V)))
+    """dynamo_fweight_divide(v, F, tau) with MATLAB's FFTW (pydyn.matlab_numerics)."""
+    return MN.fweight_divide(v, F, tau)
 
 
 def fsc_fouriermask(a, b, ns):
+    """dynamo_fsc_fouriermask(a, b, ns) (dynamo_fsc_fouriermask.m): shells R in [k*dr, (k+1)*dr), k = 1..ns,
+    dr = (n/2)/ns, R from ndgrid(-n/2:n/2-1); sequential sums in index order; FFTW."""
     n = a.shape[0]
-    Aa = np.fft.fftshift(np.fft.fftn(a))
-    Bb = np.fft.fftshift(np.fft.fftn(b))
     u = np.arange(-n // 2, n // 2, dtype=np.float64)
     uz, uy, ux = np.meshgrid(u, u, u, indexing="ij")
     R = np.sqrt(ux * ux + uy * uy + uz * uz)
     dr = (n / 2) / ns
-    out = np.empty(ns)
-    for k in range(1, ns + 1):
-        s = (R >= k * dr) & (R < (k + 1) * dr)
-        num = np.real(np.sum(Aa[s] * np.conj(Bb[s])))
-        out[k - 1] = num / (np.sqrt(np.sum(np.abs(Aa[s]) ** 2)) * np.sqrt(np.sum(np.abs(Bb[s]) ** 2)))
-    return out
+    shells = [(R >= k * dr) & (R < k * dr + dr) for k in range(1, ns + 1)]
+    return MN.shell_fsc(a, b, shells)
 
 
-def finalize(parts, mask, n, fmin=3.0, sym=None):
-    """Merge per-GPU partial sums and compute Dynamo's averaging outputs (float64, host).
+def finalize(state, nh, mask, n, fmin=3.0, sym=None):
+    """Dynamo's averaging outputs from the chained sums (dynamo_average.m FSC path, 05 3.5-3.8), float64, host:
+    per half average_raw = normalize_roi(S ./ max(Ntags - C, 1)); fweight = F / max(F);
+    average = normalize_roi(fweight_divide(average_raw, fweight, fthreshold)), fthreshold = fmin/Ntags (or 1/Ntags);
+    then average_raw = 0.5 (odd + even), fweight = 0.5 (odd + even), average = fweight_divide(average_raw, fweight,
+    0.1), fmask = fweight >= 1/(Ntags + 1), eo_fsc from the two half averages.
     sym: the fsc_actions 'sym <op>;' of the pipeline (genericInput2Average.m:241-258): before the FSC each half
     goes through dynamo_particle(half, 'actions', 'sym <op>;', 'fmask', binarize(half fmask, 0.5)) (fsc_local,
     dynamo_average.m:2808-2823), which is dynamo_sym(half, op, 'fmask', that fmask) [RUN: headless 1.1.514, max abs 0
     for h[-1.4,0.3] and c3 with a random binary fmask, i.e. with the Fourier division: benchmarks/06_abp_align_eo/implA/
-    particle_sym.m/.log]; with flat weights it is dynamo_sym(half, op) (10a 5.4). None or c1: no action."""
-    S = sum(p["S"] for p in parts)
-    C = sum(p["C"] for p in parts)
-    F = sum(p["F"] for p in parts)
-    cnt = sum(p["n"] for p in parts)
+    particle_sym.m/.log]; c1 parses as 'none' (dynamo_zaux_parse_sym.m): no action."""
+    S, C, F = state["S"], state["C"], state["F"]
+    if min(int(nh[0]), int(nh[1])) < 1:
+        raise NotImplementedError("finalize needs particles in both halves (the even/odd FSC path of dynamo_average)")
     halves = []
     for k in (0, 1):
-        nk = int(cnt[k])
-        D = nk - C[k]
+        nk = int(nh[k])
+        D = nk * np.ones(S.shape[1]) - C[k]
         D[D == 0] = 1
         A_raw = normalize_roi((S[k] / D).reshape(n, n, n), mask)
-        Fk = (F[k] / nk).reshape(n, n, n)
+        Fk = F[k].reshape(n, n, n)
         Fk = Fk / Fk.max()
-        tau = fmin / nk if fmin < nk else 1.0 / nk
+        tau = (1.0 / nk) * fmin if fmin < nk else 1.0 / nk                  # dynamo_average.m:2215-2219
         Ak = normalize_roi(fweight_divide(A_raw, Fk, tau), mask)
         halves.append((A_raw, Fk, Ak, Fk >= tau))
     ns = n // 4
@@ -251,14 +196,17 @@ def finalize(parts, mask, n, fmin=3.0, sym=None):
             vh = [dynamo_sym(h[2], sym, (np.asarray(h[3], dtype=np.float64) >= 0.5).astype(np.float64))[0]
                   for h in halves]
     fs = fsc_fouriermask(vh[0], vh[1], ns)
-    eo_fsc = np.interp(np.linspace(1, n / 2, n // 2), np.linspace(1, n / 2, ns), fs)
+    # fsc_local (dynamo_average.m:2826-2840): interp1(linspace(1, s1/2, numshells), fsc, linspace(1, s1/2, s1/2)),
+    # all NaN if a shell value is NaN
+    eo_fsc = (MN.interp1(MN.linspace(1, n / 2, ns), fs, MN.linspace(1, n / 2, n // 2)) if not np.isnan(fs).any()
+              else np.full(n // 2, np.nan))
     A_raw = 0.5 * (halves[0][0] + halves[1][0])
     Fm = 0.5 * (halves[0][1] + halves[1][1])
     average = fweight_divide(A_raw, Fm, 0.1)
-    ntags = int(cnt.sum())
+    ntags = int(nh[0]) + int(nh[1])
     fmask = (Fm >= 1.0 / (ntags + 1)).astype(np.float32)
     return {"average": average, "average_unweighted": A_raw, "fweight_average_raw": Fm,
-            "fmask_average": fmask, "eo_fsc": eo_fsc, "n": [int(c) for c in cnt]}
+            "fmask_average": fmask, "eo_fsc": eo_fsc, "n": [int(nh[0]), int(nh[1])]}
 
 
 def halves_for(rows):
@@ -371,6 +319,43 @@ void accum_serial(const float* V, double* S, double* C, const int B, const long 
     }
     S[v] = s; C[v] = c;
 }
+extern "C" __global__
+void roi_moments(const double* X, const int B, const long n, double* mu, double* sd)
+{   // dynamo_normalize_roi_one in single-thread MATLAB: X is [n, B] (mask voxels in index order, one column per
+    // particle); miroi = sum(iroi)/n, y = iroi - miroi, stdiroi = sqrt(sum(abs(y - sum(y)/n).^2)/(n-1)); every sum
+    // sequential from 0, one rounding per operation.
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B) return;
+    double s = 0.0;
+    for (long k = 0; k < n; k++) s = __dadd_rn(s, X[k * B + b]);
+    double m = __ddiv_rn(s, (double)n);
+    double s2 = 0.0;
+    for (long k = 0; k < n; k++) s2 = __dadd_rn(s2, __dsub_rn(X[k * B + b], m));
+    double yb = __ddiv_rn(s2, (double)n);
+    double s3 = 0.0;
+    for (long k = 0; k < n; k++) { double d = __dsub_rn(__dsub_rn(X[k * B + b], m), yb); s3 = __dadd_rn(s3, __dmul_rn(d, d)); }
+    mu[b] = m;
+    sd[b] = n > 1 ? __dsqrt_rn(__ddiv_rn(s3, (double)(n - 1))) : 0.0;
+}
+extern "C" __global__
+void accum_ordered(const float* V, const float* R, const double* mu, const double* sd, const int* half,
+                   const double* nh, const int B, const long N, double* S, double* C, double* F)
+{   // dynamo_average.m main loop (:1974-1997) and weight loop (:2167-2187) per half, particles in the given
+    // (ascending tag) order: r = sharpShiftRot(p) (V, NaN outside); r(nan) = 0; r = (r - miroi) ./ stdiroi;
+    // r(nan) = 0; average_raw += r; average_nan += nan; totalFmask += fmask / Ntags (R = rotated wedge).
+    long v = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= N) return;
+    double s0 = S[v], s1 = S[N + v], c0 = C[v], c1 = C[N + v], f0 = F[v], f1 = F[N + v];
+    for (int b = 0; b < B; b++) {
+        float x = V[(long)b * N + v];
+        int nn = isnan(x);
+        double r = nn ? 0.0 : __ddiv_rn(__dsub_rn((double)x, mu[b]), sd[b]);
+        double w = __ddiv_rn((double)R[(long)b * N + v], nh[half[b]]);
+        if (half[b] == 0) { s0 = __dadd_rn(s0, r); c0 = __dadd_rn(c0, nn ? 1.0 : 0.0); f0 = __dadd_rn(f0, w); }
+        else              { s1 = __dadd_rn(s1, r); c1 = __dadd_rn(c1, nn ? 1.0 : 0.0); f1 = __dadd_rn(f1, w); }
+    }
+    S[v] = s0; S[N + v] = s1; C[v] = c0; C[N + v] = c1; F[v] = f0; F[N + v] = f1;
+}
 """
 _mex_k = {}
 
@@ -392,6 +377,21 @@ def mex_rotation_matrix(tdrot, tilt, narot):
     return [cotd * cona - sitd * coti * sina, - cona * sitd - cotd * coti * sina, sina * siti,
             cotd * sina + cona * sitd * coti, cotd * cona * coti - sitd * sina, -cona * siti,
             sitd * siti, cotd * siti, coti]
+
+
+def rot_sphere0(vol, eulers):
+    """dynamo_rot(vol, eulers) on the GPU: dynamo_shift_rot_mex masking option 0 with outscope 0 (dynamo_rot.m,
+    dynamo_shift_rot.m; mex-exact kernel average.rot_mex0: double matrix of float32(eulers), implicit sphere
+    |r| >= n/2 -> 0, pivots outside the box -> 0). The volume enters as float32, as the mex converts it."""
+    n = vol.shape[0]
+    N = n ** 3
+    E = np.atleast_2d(np.asarray(eulers, dtype=np.float64))
+    mats = np.array([mex_rotation_matrix(*e) for e in E], dtype=np.float64)
+    out = cp.empty((len(E), n, n, n), dtype=cp.float32)
+    _mex_kernel("rot_mex0")(((len(E) * N + 255) // 256,), (256,),
+                            (cp.asarray(vol, dtype=cp.float32), cp.zeros(len(E), dtype=cp.int64), cp.asarray(mats.ravel()),
+                             out, np.float32(0.0), np.int32(n), np.int64(len(E) * N)))
+    return out.get().astype(np.float64)
 
 
 def sharp_shift_rot_params(row):
@@ -447,7 +447,8 @@ def shift_rot_mex_cpu(vol, m, s, implicit_sphere=False, outscope=np.nan):
 
 
 def console_average_sums(read_particle, rows, n, device="auto", batch=512):
-    """Serial-order sums of dynamo_average's default console path (08b 4.2): for each row (ascending tags), rotate
+    """The console daverage backend (pydyn.console.daverage): serial-order sums of dynamo_average's default console
+    path (08b 4.2): for each row (ascending tags), rotate
     the particle with the mex-exact kernel, NaN -> 0, S += r, C += isnan(r). Returns float64 [z, y, x] S and C.
     read_particle(i) returns the float32 [z, y, x] particle of rows[i]."""
     P = len(rows)

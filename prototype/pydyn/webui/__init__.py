@@ -5,7 +5,6 @@
   dcp --p NAME --d DATA --template REF.em --masks default --t TABLE.tbl [--m F] [--cm F] [--fm F] [--sm F]
                               create it first (dcp.new with Dynamo's options and checks), then open it;
                               --no-gui creates only; --force replaces an existing project (dcp --help)
-  dcp --tk [NAME]             the older Tk view (pydyn.gui)
   dcp --serve [--p NAME]      no window: serve the view and print its address (for a browser on this machine)
 
 From Python (from pydyn import *): dcp(), dcp.open('p') and dcp.new(...) open the same window in a separate
@@ -70,7 +69,7 @@ _NEW_OPTIONS = (
     ("smask", ("sm", "smask", "smoothing_mask"), "FILE", "smoothing mask"),
 )
 _LONG = {w for _, ws, _, _ in _NEW_OPTIONS for w in ws if len(w) > 1} | {
-    "project", "force", "fo", "forceOverwrite", "gui", "no-gui", "serve", "tk", "help"}
+    "project", "force", "fo", "forceOverwrite", "gui", "no-gui", "serve", "help"}
 EXAMPLES = """examples:
   dcp                                      the project manager in this folder
   dcp --p bin8_align_1                     open an existing project
@@ -102,7 +101,6 @@ def _parser():
                    help="open the window after creating (default 1)")
     g.add_argument("--no-gui", dest="gui", action="store_const", const=0, help="create only, do not open the window")
     o = ap.add_argument_group("other")
-    o.add_argument("--tk", action="store_true", help="the older Tk view")
     o.add_argument("--serve", action="store_true", help="no window: serve the view and print its address")
     return ap
 
@@ -110,9 +108,6 @@ def _parser():
 def main(argv=None):
     """The `dcp` command (dcp --help)."""
     argv = _normalise(sys.argv[1:] if argv is None else list(argv))
-    if argv[:1] == ["--tk"]:
-        from .. import gui
-        return gui.main([a for a in argv[1:] if a not in ("-p", "--p", "--project")])
     a = _parser().parse_args(argv)
     if a.project and a.name and a.project != a.name:
         print("[pydyn dcp] two project names given: %s and %s" % (a.name, a.project))

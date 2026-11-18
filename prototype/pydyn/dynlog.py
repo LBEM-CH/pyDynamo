@@ -818,22 +818,3 @@ def expected_log_lines(project_dir, cwd=None, data_dir=None, iterations=None, ru
         lines += ending_lines(cip, tsc, tbeg, tend)
         lines += check_ok_lines(ite)
     return lines
-
-
-# =====================================================================================================
-# project folder layout (for checks; spec section 1)
-# =====================================================================================================
-
-def project_tree(project_dir):
-    """Sorted relative paths (dirs end with '/') under a project folder."""
-    out = []
-    for root, dirs, files in os.walk(project_dir):
-        rel = os.path.relpath(root, project_dir)
-        for d in dirs:
-            out.append(os.path.normpath(os.path.join(rel, d)) + "/")
-        for f in files:
-            out.append(os.path.normpath(os.path.join(rel, f)))
-    return sorted(out)
-
-
-PYDYN_ONLY_FILES = ("pydyn_log.txt", "pydyn_report.json")

@@ -7,7 +7,7 @@ while IFS= read -r -d '' f; do
   [ -f "$f" ] || continue
   kb=$(( $(stat -c %s "$f") / 1024 ))
   case "$f" in
-    *.em|*.mrc|*.mrcs|*.rec|*.st|*.tif|*.tiff|*.btbl|*.npy|*.npz|*.h5|*.nsys-rep|*.sqlite|*.tar|*.gz|*.zip)
+    *.em|*.mrc|*.mrcs|*.rec|*.st|*.tif|*.tiff|*.btbl|*.btbl.pydyn|*.tbl|*.mat|*.npy|*.npz|*.h5|*.nsys-rep|*.sqlite|*.tar|*.gz|*.zip)
       echo "pre-commit: refusing data/binary file: $f (${kb} KB)"; bad=1 ;;
   esac
   if [ "$kb" -gt "$MAX_KB" ]; then echo "pre-commit: refusing large file: $f (${kb} KB > ${MAX_KB} KB)"; bad=1; fi

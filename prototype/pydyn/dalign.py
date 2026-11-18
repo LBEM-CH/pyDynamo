@@ -13,7 +13,8 @@ is C order of a [z, y, x] array.
 
 Precision: the rotation kernels follow the mex operation by operation (float32, double matrix from glibc cos/sin of
 the float32 angles, no FMA) and are exact for the inputs tested (09b 9.2, 08b 4.4). Everything else is double, as in
-MATLAB, but FFTs (pocketfft vs FFTW), sums and MATLAB's own sin/cos/atan2 are not bit-identical: the scores and
+MATLAB, and MATLAB's sin/cos/atan2/acos are reproduced bit for bit (pydyn.fdlibm), but FFTs (pocketfft vs FFTW)
+and sums are not bit-identical here yet: the scores and
 sub-pixel shifts agree with Dynamo to roundoff, and the chosen orientation is the same unless two orientations tie
 within roundoff. See tests/test_eo_abp.py for the verified tolerances.
 
@@ -24,6 +25,9 @@ raises NotImplementedError.
 import math
 
 import numpy as np
+
+from . import fdlibm as _F
+from . import matlab_numerics as MN
 
 try:
     import scipy.fft as _fft
@@ -73,54 +77,15 @@ def matlab_colon(a, d, b):
     return v
 
 
-def matlab_linspace(d1, d2, n):
-    """linspace(d1, d2, n) of MATLAB R2019a: d1 + (0:n-1)*(d2-d1)/(n-1), endpoints set exactly."""
-    n = int(n)
-    if n < 1:
-        return np.zeros(0)
-    if n == 1:
-        return np.array([float(d2)])
-    n1 = n - 1
-    y = d1 + np.arange(n, dtype=np.float64) * (d2 - d1) / n1
-    y[0], y[-1] = d1, d2
-    return y
+class _MatlabTrig:
+    """MATLAB-side scalar trigonometry as MATLAB R2019a computes it (fdlibm, pydyn.fdlibm: bit-identical), for every
+    MATLAB-side angle computation (euler2matrix, matrix2euler, angleset, table transforms; tests/test_eo_abp.py).
+    The C library's sin/cos/atan2/acos differ from MATLAB's in the last bit for some arguments."""
+    sin, cos, atan2, acos = staticmethod(_F.sin), staticmethod(_F.cos), staticmethod(_F.atan2), staticmethod(_F.acos)
+    name = "fdlibm"
 
 
-class _GlibcTrig:
-    """MATLAB-side scalar trig. Default: glibc (Python math). set_matlab_trig() switches to the MATLAB runtime's own
-    libmwmathutil routines (mu::Sin/mu::Cos<double>, muDoubleScalarAtan2/Acos), which makes the rigid-body and
-    angle computations bit-identical to Dynamo's (tests/test_eo_abp.py) -- a math library of the runtime, not MATLAB
-    or Dynamo code, as for the column-28 parity (pydyn.dynproject.MatlabTrig)."""
-    sin, cos, atan2, acos = staticmethod(math.sin), staticmethod(math.cos), staticmethod(math.atan2), \
-        staticmethod(math.acos)
-    name = "glibc"
-
-
-_T = _GlibcTrig()
-
-
-def set_matlab_trig(enabled=True):
-    """Use the MCR's libmwmathutil trig for every MATLAB-side angle computation (euler2matrix, matrix2euler,
-    angleset, table transforms); enabled=False restores glibc."""
-    global _T
-    if not enabled:
-        _T = _GlibcTrig()
-        return _T
-    import ctypes
-    from .dynproject import MatlabTrig, MCR_ROOT
-    mt = MatlabTrig()
-    lib = ctypes.CDLL(MCR_ROOT + "/bin/glnxa64/libmwmathutil.so")
-    a2, ac = lib.muDoubleScalarAtan2, lib.muDoubleScalarAcos
-    a2.restype, a2.argtypes = ctypes.c_double, [ctypes.c_double, ctypes.c_double]
-    ac.restype, ac.argtypes = ctypes.c_double, [ctypes.c_double]
-
-    class _M:
-        name = "matlab-libmwmathutil"
-        sin = staticmethod(lambda x: float(mt.sin(np.array([x], dtype=np.float64))[0]))
-        cos = staticmethod(lambda x: float(mt.cos(np.array([x], dtype=np.float64))[0]))
-        atan2, acos = staticmethod(a2), staticmethod(ac)
-    _T = _M()
-    return _T
+_T = _MatlabTrig()
 
 
 def mm3(a, b):
@@ -192,14 +157,14 @@ def angleincrement2list(aperture, interval, inplane_range=0, inplane_sample=1, o
             tdrots = [0.0]
         else:
             c, s = _T.cos(tilt_north * math.pi / 180), _T.sin(tilt_north * math.pi / 180)
-            arg = (_T.cos(interval * math.pi / 180) - c ** 2) / s ** 2
+            arg = (_T.cos(interval * math.pi / 180) - c * c) / (s * s)       # MATLAB c^2 = c*c
             if arg > 1 or arg < -1:                                   # imag(acos) ~= 0
                 print("correcting numerical instability generating angles, probably the south  pole")
                 tdrots = [0.0]
             else:
                 max_interval = _T.acos(arg) * 180 / math.pi
                 nsec = math.floor(360 / max_interval) + 1
-                tdrots = list(matlab_linspace(0, 360, nsec + 1)[:-1])
+                tdrots = list(MN.linspace(0, 360, nsec + 1)[:-1])           # MATLAB linspace
         for td_n in tdrots:
             td, ti, na_t = compose_rotations((td_n, tilt_north, 0.0), (td_old, ti_old, 0.0))
             seed = _best_narot((td_old, ti_old, na_old), (td, ti, na_t))

@@ -1,8 +1,9 @@
-# pyDynamo environment lock (uv venv "pydynamo", CPython 3.11.18 python-build-standalone cpython-3.11.18-linux-x86_64-gnu)
-# Exact versions of the conda env (.envs/pydynamo, 2026-11-12) that pyDynamo's Dynamo parity was verified with.
-# Every installed file of these wheels was checked byte-identical to that env; outputs were checked bit-identical.
+# pyDynamo environment lock: the uv venv "pydynamo" (.envs/pydynamo), CPython 3.11.18 from python-build-standalone
+# (cpython-3.11.18-linux-x86_64-gnu). requirements/recreate.sh builds the env from this file; see README-env.txt.
+# pyDynamo's bit-identical Dynamo parity was verified with exactly these versions; change one only after re-checking it.
+# requirements/verify_env.py checks every installed file against pydynamo-manifest.json and pydynamo-gui-manifest.json.
 # Install ONLY with:  uv pip sync --require-hashes --python .envs/pydynamo/bin/python requirements/pydynamo-lock.txt
-# then pydyn editable: .envs/pydynamo/bin/python -I -m pip install --no-deps -e .     (see requirements/README-env.txt)
+# then pydyn editable: .envs/pydynamo/bin/python -I -m pip install --no-deps -e .
 #
 # Pins (regenerate with uv pip compile --generate-hashes --no-annotate --no-header from exactly these lines):
 #   runtime            numpy==2.4.6  scipy==1.17.1  cupy-cuda12x==14.2.0  cuda-pathfinder==1.8.6 (CuPy's library finder)
@@ -15,7 +16,7 @@
 #                                       not loaded: CuPy 14.2.0 links the CUDA 12.9 runtime statically (runtime 12090)
 #   not included (not loaded by pydyn; add the same versions if a later pydyn needs them): nvidia-curand-cu12==10.3.5.147,
 #     nvidia-nvjitlink-cu12==12.4.127, nvidia-cusolver/cusparse/cudnn/nccl/...; torch, triton, pandas, starfile, mrcfile,
-#     sympy and the rest of the old env (nothing in pydyn or its tests imports them)
+#     sympy and other general-purpose packages (nothing in pydyn or its tests imports them)
 #   tests              pytest==9.2.0  iniconfig==2.3.1  packaging==26.3  pluggy==1.7.0  pygments==2.21.0
 #   installer          pip==26.2.2 (for pip install -e)
 --index-url https://pypi.org/simple
@@ -213,7 +214,7 @@ scipy==1.17.1 \
 
 
 # ==================================================================================================================
-# GUI section (added 2026-11-12; Addons added 2026-11-16): the Qt viewers of pydyn.viewers (dmapview, dview, dslices
+# GUI section: the Qt viewers of pydyn.viewers (dmapview, dview, dslices
 # overlays) and the dcp window of pydyn.webui. No numerical code path imports these; the 14 numerical/test packages
 # above are unchanged (verify_env.py).
 #   pyside6-addons==6.11.3       Qt for Python add-on modules (same licence): QtWebEngine (Chromium), which shows the
@@ -222,7 +223,7 @@ scipy==1.17.1 \
 #                                QtWidgets and the xcb/offscreen platform plugins. The PySide6 meta package is not
 #                                installed.
 #   shiboken6==6.11.3            its binding runtime (same licence, same release)
-# Linux wheels are manylinux_2_34_x86_64 (needs glibc >= 2.34; the cluster nodes have Ubuntu 22.04, glibc 2.35).
+# Linux wheels are manylinux_2_34_x86_64 (needs glibc >= 2.34, e.g. Ubuntu 22.04 or newer).
 # The xcb platform plugin also needs system X libraries (libxcb-cursor0, libxkbcommon-x11-0, libxcb-icccm4, ...);
 # without them use QT_QPA_PLATFORM=offscreen (tests) -- see requirements/README-env.txt.
 # Regenerate:  printf 'pyside6-essentials==6.11.3\npyside6-addons==6.11.3\nshiboken6==6.11.3\n' | uv pip compile --generate-hashes

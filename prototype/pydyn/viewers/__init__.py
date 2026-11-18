@@ -11,11 +11,11 @@ Console (names as in Dynamo; MATLAB-style name/value pairs work):
 
 Shell:  python -I -m pydyn.viewers mapview a.em b.em | view t.em | slices t.em --kind z --overlay m.em
 
-dcp windows (Tk, pydyn.gui) call: view_file, overlay_mask, show_files, show_last_averages, dtplot,
+dcp window (pydyn.webui, through pydyn.dcpcontrol) calls: view_file, overlay_mask, show_files, show_last_averages, dtplot,
 plot_bandpass_fsc (see each docstring).
 
-Why a separate process: Tk and Qt each need to own the main thread's event loop, and Qt widgets must live in the
-thread that created QApplication, so the two toolkits cannot share one Python process safely. Each viewer is
+Why a separate process: the dcp window (Qt WebEngine) and the console each run their own event loop, and Qt
+widgets must live in the thread that created QApplication, so a viewer cannot share their process safely. Each viewer is
 therefore started as `python -I -m pydyn.viewers ...` with a clean environment (no PYTHONPATH / LD_LIBRARY_PATH /
 QT_PLUGIN_PATH, so the login shell's other Qt cannot be loaded into PySide6), returns at once like a MATLAB figure,
 and a crash of a viewer can never take the dcp windows (or their unsaved state) down. Volumes are passed as file
@@ -38,7 +38,7 @@ _PROTO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 
 
 def qt_problem():
-    """None if a viewer window can probably open, else the reason (like pydyn.gui.display_problem)."""
+    """None if a viewer window can probably open, else the reason (like pydyn.webui.display_problem)."""
     plat = os.environ.get("QT_QPA_PLATFORM", "")
     if sys.platform.startswith("linux") and not plat.startswith(("offscreen", "minimal", "vnc")) and \
             not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
@@ -232,7 +232,7 @@ def plot_bandpass_fsc(name, vpr=None, wait=False):
 
 
 # =====================================================================================================================
-# hooks for the dcp windows (pydyn.gui / pydyn.dcpcontrol)
+# hooks for the dcp window (pydyn.dcpcontrol)
 # =====================================================================================================================
 
 def view_file(path, title=None):

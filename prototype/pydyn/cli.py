@@ -1,6 +1,6 @@
 """Command-line entry points.
 
-  pydynamo execute_project NAME [--gpus 0,1,2,3|all] [--engine exact|fast] [--exact-sms N] [--matlab-trig] [--keep-temp]
+  pydynamo execute_project NAME [--gpus 0,1,2,3|all] [--engine exact|fast] [--exact-sms N] [--keep-temp]
                          [--iterations N] [--report PATH]
   dynamo_execute_project NAME [same options]   Dynamo's command name: what <name>.exe (byte-identical to Dynamo's, last
                          line `dynamo_execute_project <name>`) runs when pyDynamo's environment is active
@@ -9,8 +9,9 @@
   pydynamo info NAME           rounds, iterations, next iteration, data and seeds of a project
   pydynamo                     an interactive Python console with Dynamo's commands loaded (type dcp.new(...) there)
   dtrandomize_azimuth --i TABLE --o TABLE           Dynamo's dtrandomize_azimuth on files
-  daverage --d DATA --t TABLE --o AVERAGE.em [--mw N] [--device auto|gpu|cpu]   Dynamo's daverage, the average written
+  daverage --d DATA --t TABLE --o AVERAGE.em [--mw N] [--device auto|gpu|cpu] [--all-outputs]   Dynamo's daverage, the average written
   dcp [args]                   opens the dcp window (pydyn.webui.main; dcp --help)
+  dmapview FILE / dview FILE   Dynamo's dmapview / dview viewers (pydyn.viewers)
 
 Run from the folder that contains the project (as Dynamo). 'python -I -m pydyn ...' is the same as 'pydynamo'.
 The console scripts restart themselves once in a clean environment (no PYTHONPATH / LD_LIBRARY_PATH / user site),
@@ -64,8 +65,6 @@ def _execute_args(e):
     e.add_argument("--gpus", default=None,
                    help="comma-separated device ids, or all: every GPU this process sees (in a Slurm job, the job's "
                         "own), up to the number of particle parts. Default: gpu_identifier_set, as Dynamo")
-    e.add_argument("--matlab-trig", action="store_true",
-                   help="MATLAB's own sin/cos (MCR libmwmathutil) for bit-exact column 28; needs the MCR files")
     e.add_argument("--engine", choices=("exact", "fast"), default=None,
                    help="GPU alignment engine. exact: Dynamo 1.1.514's own kernels, cuFFT 8 and cuBLAS 8, bit-identical "
                         "to the official engine on the same GPU model; fast: pyDynamo's batched engine (float32 "
@@ -82,7 +81,7 @@ def _execute_args(e):
 def _run_execute(a):
     from .execute import execute_project
     gpus = "all" if a.gpus == "all" else ([int(g) for g in a.gpus.split(",")] if a.gpus else None)
-    ok = execute_project(a.name, gpus=gpus, matlab_trig=a.matlab_trig, keep_temp=a.keep_temp,
+    ok = execute_project(a.name, gpus=gpus, keep_temp=a.keep_temp,
                          iterations=a.iterations, engine=a.engine, exact_sms=a.exact_sms, report=a.report)
     return 0 if ok else 1
 
@@ -126,7 +125,7 @@ def main(argv=None):
 
 
 def dcp_main():
-    """The `dcp` command: the dcp window (pydyn.webui; `dcp --tk` for the older Tk view)."""
+    """The `dcp` command: the dcp window (pydyn.webui)."""
     _clean_reexec("dcp_main")
     from . import webui
     return webui.main(sys.argv[1:])

@@ -17,6 +17,8 @@ import math
 
 import numpy as np
 
+from .. import matlab_numerics as MN
+
 AXES = ("x", "y", "z")
 
 
@@ -213,13 +215,6 @@ def dview_labels(v):
         label = matlab_g("Max: %5.2g Min: %5.2g Mean: %5.2g", float(np.nanmax(v)), float(np.nanmin(v)), mean_value)
     nz, ny, nx = v.shape
     return label, "%d x %d x %d voxels" % (nx, ny, nz)
-
-
-def montage_grid(n_tiles, dims=None):
-    """(rows, cols) of dynamo_montage: nice_2d_distribution, or dims = [rows, cols] (dynamo_montage.m: dim)."""
-    if dims is None:
-        return nice_2d_distribution(n_tiles)
-    return int(dims[0]), int(dims[1])
 
 
 def assemble(tiles, rows, cols, fill=0.0):
@@ -554,10 +549,9 @@ class MapviewModel:
         """dynamo_normalize_roi without a mask: (v - mean) / std over the non-NaN voxels (std with N-1)."""
         out = []
         for v in self.volumes:
-            ok = ~np.isnan(v)
-            mu = v[ok].mean()
-            sd = v[ok].std(ddof=1)
-            out.append((v - mu) / sd)
+            ones = np.ones(v.shape)                             # dynamo_normalize_roi.m:106-111: no mask ->
+            w = MN.normalize_roi(MN.normalize_roi(v, ones), ones)  # dynamo_normalize_roi_one twice
+            out.append(w)
         self.volumes = out
 
     def op_restore(self):

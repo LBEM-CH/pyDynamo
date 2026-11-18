@@ -30,8 +30,6 @@ from . import dynio
 
 NC = _conv.NC
 RC = _conv.RC
-NC_NAMES = [p["name"] for p in NC]
-RC_NAMES = [p["name"] for p in RC]
 _NC = {p["name"]: p for p in NC}
 _RC = {p["name"]: p for p in RC}
 # hidden round parameters: dynamo_vpr_convention.m:1538-1541 (in RC order)
@@ -491,7 +489,7 @@ def modify(vpr, *pairs):
 # =====================================================================================================================
 
 def data_info(folder, volume_type="particle"):
-    """dynamo_info_data.m:186-420 for a Dynamo data folder: tags (ascending), N, padding, l / size / extension of the
+    r"""dynamo_info_data.m:186-420 for a Dynamo data folder: tags (ascending), N, padding, l / size / extension of the
     sample particle (the largest tag). Padding (:385-409): files are scanned in name order (dynamo_regexp2files,
     ASCII order); until a padding is found, each file is tried with 7 down to 2 digits; the first match fixes the
     padding and the pattern particle_\d{padding}, which is then used for every later file (a file of another width,
@@ -558,10 +556,10 @@ def data_info(folder, volume_type="particle"):
 # =====================================================================================================================
 
 def _ellipsoid_default(l):
-    """dynamo_ellipsoid(l/2-1, l, (l/2+1)*[1 1 1]) == pydyn.project.default_mask (byte-checked, 08a 2.3)."""
+    """dynamo_ellipsoid(l/2-1, l, (l/2+1)*[1 1 1]) == pydyn.masks.default_mask (byte-checked, 08a 2.3)."""
     if l % 2:
         raise NotImplementedError("odd sidelength %d: the sphere centre of dynamo_ellipsoid is not verified" % l)
-    from .project import default_mask
+    from .masks import default_mask
     return default_mask(int(l)).astype(np.float64)
 
 

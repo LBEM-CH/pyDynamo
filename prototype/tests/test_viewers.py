@@ -318,7 +318,12 @@ def test_qt_dview_and_slices_windows(qapp):
 @pytest.mark.skipif(not HAVE_QT, reason="PySide6 is not installed")
 def test_viewer_process_and_launcher(tmp_path, monkeypatch):
     """The separate process: files on the command line and arrays through temporary .npy files (deleted)."""
+    import tempfile
     import pydyn.viewers as V
+    tmp = tmp_path / "tmpdir"
+    tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(tmp))                              # this test's own temporary folder
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp))
     a = np.random.default_rng(7).normal(size=(8, 8, 8)).astype(np.float32)
     f1, f2 = str(tmp_path / "a.em"), str(tmp_path / "b.em")
     dynio.write_em(f1, a)
@@ -333,7 +338,7 @@ def test_viewer_process_and_launcher(tmp_path, monkeypatch):
     out2 = str(tmp_path / "arr.png")
     p = V._launch(["view", "--snap", out2], arrays=[a], wait=True)
     assert p.returncode == 0 and os.path.isfile(out2)
-    leftovers = [d for d in os.listdir(os.environ.get("TMPDIR", "/tmp")) if d.startswith("pydyn_view_")]
+    leftovers = [d for d in os.listdir(str(tmp)) if d.startswith("pydyn_view_")]
     assert not leftovers
 
 

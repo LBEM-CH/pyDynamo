@@ -116,7 +116,7 @@ def _blob(n=32, seed=0):
 
 
 def _case(n=32, P=3):
-    from pydyn.project import default_mask
+    from pydyn.masks import default_mask
     t = _blob(n)
     rs = np.random.RandomState(1)
     parts, rows = [], np.zeros((P, 35), dtype=np.float32)
@@ -134,7 +134,7 @@ def _case(n=32, P=3):
 @pytest.mark.gpu
 @needs_dynamo
 def test_exact_recovers_known_shift():
-    from pydyn.project import default_mask
+    from pydyn.masks import default_mask
     n = 32
     t = _blob(n)
     shift = (2, -1, 3)
@@ -170,6 +170,26 @@ def test_exact_batched_is_bitwise_the_one_orientation_loop(batch):
         a = np.array(r1[5][:4] + tuple(r1[5][4]), np.float32)
         b_ = np.array(r2[5][:4] + tuple(r2[5][4]), np.float32)
         assert np.array_equal(a.view(np.int32), b_.view(np.int32))
+
+
+@pytest.mark.gpu
+@needs_dynamo
+@pytest.mark.parametrize("opts", ["", "red=cublas", "fuse=0", "sync=batch", "mats=batch,nopad=0"])
+def test_exact_speed_options_and_their_fallbacks_give_the_same_table(opts, monkeypatch):
+    """The batched path's options (on by default) switched off one by one through PYDYN_EXACT_OPTS: every variant
+    gives the refined table of Dynamo's own one-orientation loop (batch 1) bit for bit."""
+    t, m, parts, rows = _case()
+    eng = E.Engine(t, m, _Card(), batch=1, exact=True)
+    eng.prepare_particles(parts, rows)
+    ref = eng.refine(rows)
+    monkeypatch.setenv("PYDYN_EXACT_OPTS", opts)
+    eng = E.Engine(t, m, _Card(), batch=64, exact=True)
+    eng.prepare_particles(parts, rows)
+    out = eng.refine(rows)
+    assert np.array_equal(ref.view(np.int32), out.view(np.int32)), opts
+    if opts == "":                                       # the default really runs the batched kernels (no fallback)
+        ex = eng._ex
+        assert ex.sync_level and ex.ops.reductions and ex.fuse and ex.nopad and ex.mats_level
 
 
 @pytest.mark.gpu

@@ -16,7 +16,7 @@ Arrays are [z, y, x] (C order), the memory layout of a MATLAB (x, y, z) array, a
 
 Floating point. dynamo_mollify convolves with fftn / ifftn, and dynamo_blob uses exp. MATLAB R2019a (MCR 9.6, the
 runtime of Dynamo 1.1.514) computes them with FFTW 3.3.3 ('estimate' planner; same result with 1 or 8 threads) and
-with its own scalar exp (muDoubleScalarExp of libmwmathutil). The low-order bits of the convolution (the round-off
+with fdlibm's exp. The low-order bits of the convolution (the round-off
 "noise floor" outside the mask, |v| < 1e-13) depend on both, and they survive the [0, 1] rescaling and the float32
 write. Measured against headless Dynamo dumps (benchmarks/06_abp_align_eo/implB, scripts k1-k4):
 
@@ -25,13 +25,12 @@ write. Measured against headless Dynamo dumps (benchmarks/06_abp_align_eo/implB,
 * fftn(real 3-D) = FFTW r2c 3-D (FFTW_ESTIMATE) + Hermitian completion: bit-identical to MATLAB;
 * ifftn(F) for the product spectrum = FFTW complex backward 3-D (FFTW_ESTIMATE), real part, divided by N:
   bit-identical to MATLAB;
-* with both, the user's editorMask.em is reproduced byte for byte (md5 90f4bb01...), with the MATLAB runtime's
-  libmwfftw3.so.3 and with the system libfftw3.so.3 (3.3.8) alike. With numpy / scipy.fft only the voxels with
+* with both, a real dcp mask-editor mask is reproduced byte for byte with the system FFTW 3.3.8 (libfftw3.so.3),
+  exactly as with MATLAB's own FFTW 3.3.3; the averaging (pydyn.matlab_numerics) is bit-identical with it too. With numpy / scipy.fft only the voxels with
   |v| > 1e-6 are bit-identical (max |diff| below 1e-15 before the float32 write).
 
-So the FFT backend is FFTW through ctypes when a FFTW 3 library is found (environment variable PYDYN_FFTW_LIB, else
-the MATLAB runtime library of the Dynamo 1.1.514 installation, else the system libfftw3.so.3), otherwise scipy.fft
-with a printed warning. `fft_backend()` tells which one is used. Console shorthands as in Dynamo
+So the FFT backend is FFTW 3 through ctypes (environment variable PYDYN_FFTW_LIB, else the system libfftw3.so.3; no
+MATLAB library is used), otherwise scipy.fft with a printed warning. `fft_backend()` tells which one is used. Console shorthands as in Dynamo
 (S/shorthands): dmask = dynamo_mask, dmollify = dynamo_mollify, dcylinder = dynamo_cylinder.
 
 Not ported (NotImplementedError): mask types other than 'cylinder' (sphere, ellipsoid, tube, shell, blob,
@@ -47,8 +46,6 @@ import numpy as np
 
 from . import dynio
 
-MCR_FFTW = "/programs/x86_64-linux/dynamo/1.1.514/MCRLinux/bin/glnxa64/libmwfftw3.so.3"
-
 # S/dynamo_mask_GUI.m:180-193
 GUI_TYPES = ("sphere", "ellipsoid", "cylinder", "tube", "shell", "blob", "missing_wedge", "missing_pyramid")
 GUI_RADIO_SETTINGS = ("r", "r1", "r2", "sx", "sy", "sz", "height", "tilt", "fwhm", "band", "gaussian", "eulers",
@@ -58,6 +55,18 @@ GUI_JUST_RADIO = ("invert",)
 # S/dynamo__wizard_masks.m:362-374: file and edit box per editor button
 EDITOR_FILES = {"align": ("editorMask.em", "mask"), "cmask": ("editorCMask.em", "cmask"),
                 "smask": ("editorSmoothingMask.em", "cmask")}      # sic: smask writes into edit_cmask (:373)
+
+
+# ===================================================================================================== default mask
+def default_mask(l):
+    """Dynamo's default alignment/classification mask: dynamo_ellipsoid(l/2-1, l, (l/2+1)*[1 1 1]) (fillSphere)."""
+    r, c = l / 2 - 1, l / 2 + 1
+    x = np.arange(l, dtype=np.float64)
+    t = ((x + 1 - c) / r) ** 2
+    # C++ order is (x-term + y-term) + z-term, with x the fastest index (last axis of our [z, y, x] arrays)
+    s = t[None, None, :] + t[None, :, None]
+    s = s + t[:, None, None]
+    return (s <= 1).astype(np.float32)
 
 
 # ===================================================================================================== FFT backend
@@ -146,7 +155,7 @@ def _fftw_candidates():
     env = os.environ.get("PYDYN_FFTW_LIB")
     if env:
         return [env]
-    out = [MCR_FFTW]
+    out = []
     sysl = ctypes.util.find_library("fftw3")
     out += [sysl] if sysl else []
     out += ["libfftw3.so.3"]
@@ -191,8 +200,13 @@ _HALF = np.array([0.5, -0.5])
 _P1, _P2, _P3, _P4, _P5 = (1.66666666666666019037e-01, -2.77777777770155933842e-03, 6.61375632143793436117e-05,
                            -1.65339022054652515390e-06, 4.13813679705723846039e-08)
 
+# matlab_exp is ported from fdlibm's e_exp.c:
+# Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+#
+# Developed at SunPro, a Sun Microsystems, Inc. business.
+# Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice is preserved.
 def matlab_exp(x):
-    """exp as MATLAB R2019a computes it (muDoubleScalarExp of libmwmathutil = fdlibm e_exp.c, no FMA), vectorised.
+    """exp as MATLAB R2019a computes it (fdlibm e_exp.c, no FMA), vectorised.
     Bit-identical to MATLAB on all 262,144 arguments of dynamo_blob(64, 6) (k4_blob_dump.m); numpy / glibc exp
     differ there by +-1 ulp in 24,518 values. |x| >= 709.78 (overflow / underflow branch) is not ported."""
     x = np.asarray(x, dtype=np.float64)
@@ -246,9 +260,11 @@ def dynamo_blob(l, fwhm):
     l = int(l)
     i = np.arange(-l // 2, l // 2, dtype=float) if l % 2 == 0 else np.arange(-(l // 2), l // 2 + 1, dtype=float)
     x3, x2, x1 = np.meshgrid(i, i, i, indexing="ij")
-    x1 = x1 / np.sqrt(2 * c[0] ** 2)
-    x2 = x2 / np.sqrt(2 * c[1] ** 2)
-    x3 = x3 / np.sqrt(2 * c[2] ** 2)
+    # MATLAB's scalar c^2 is c*c (MCR muDoubleScalarPower(x, 2) == x*x); NumPy's scalar ** 2 is C pow(), which is not
+    # x*x for every x (e.g. hwhm 2.85, 5.7, 11.4, 22.8, 37.81)
+    x1 = x1 / np.sqrt(2 * (c[0] * c[0]))
+    x2 = x2 / np.sqrt(2 * (c[1] * c[1]))
+    x3 = x3 / np.sqrt(2 * (c[2] * c[2]))
     return matlab_exp(-x1 ** 2 - x2 ** 2 - x3 ** 2)
 
 
@@ -275,8 +291,8 @@ def dynamo_cylinder(radii, my_size, position=None, smoothing_pixels=0):
         raise NotImplementedError("dynamo_cylinder with smoothing_pixels > 0")
     z, y, x = np.meshgrid(np.arange(1, s3 + 1, dtype=float), np.arange(1, s2 + 1, dtype=float),
                           np.arange(1, s1 + 1, dtype=float), indexing="ij")
-    c1 = (x - position[0]) ** 2 / rr[0] ** 2
-    c2 = (y - position[1]) ** 2 / rr[1] ** 2
+    c1 = (x - position[0]) ** 2 / (rr[0] * rr[0])                  # radii(i)^2 = r*r (scalar ** 2 is pow())
+    c2 = (y - position[1]) ** 2 / (rr[1] * rr[1])
     vol = (np.sqrt(c1 + c2) <= 1).astype(np.float64)
     vol[np.abs(z - position[2]) > h] = 0
     return vol

@@ -719,7 +719,7 @@ async function pageDestination() {
     `<div class="cardx"><h2><i class="bi bi-gpu-card"></i>GPUs <span class="hint">each click is saved into the project</span></h2>
        <div class="d-flex align-items-center gap-3 flex-wrap"><div class="btn-group" role="group" aria-label="number of GPUs">${buttons}</div>
          <span class="fw-semibold">${n} GPU${n === 1 ? "" : "s"}</span></div>
-       <div class="small mt-3">pyDynamo splits the particles into ${n} part${n === 1 ? "" : "s"}, one per GPU, as Dynamo does, and the project's files follow that split; on each GPU the memory balancer sizes the batches from its free memory.
+       <div class="small mt-3">pyDynamo splits the particles into ${n} part${n === 1 ? "" : "s"}, one per GPU, as Dynamo does, and the project's files follow that split; the default exact engine aligns 128 orientations per batch on each GPU.
          Saved in the project as <span class="mono">gpu_identifier_set = ${esc(ids.join(" ") || "none")}</span>.</div>
        <div class="small mt-2">${where}</div>
        ${zeroBased || !n ? "" : `<div class="small text-warning-emphasis mt-2"><i class="bi bi-info-circle me-1"></i>The project names devices ${esc(ids.join(" "))}. A Slurm job numbers its GPUs from 0, so the Run step runs it on the job's GPUs (<span class="mono">--gpus all</span>); click a number to save devices 0 to n−1.</div>`}
@@ -824,13 +824,13 @@ function slurmCard(st) {
     <div class="cmdbox"><code id="slLine">${esc(line)}</code><button class="btn btn-sm btn-outline-light" id="slCopy" data-copy="${esc(line)}"><i class="bi bi-clipboard"></i></button></div>
     <div id="slNotes">${slurmNotes(st)}</div>
     <div class="small text-body-secondary mt-3" id="slRamNote">${ramNote(st)}</div>
-    <div class="small text-body-secondary mt-2">pyDynamo uses what the job gets: the particle parts go to the job's GPUs, the memory balancer sizes the batches on each from its free memory, and the averaging reads the particles with up to 8 of the job's CPU cores.
+    <div class="small text-body-secondary mt-2">pyDynamo uses what the job gets: the particle parts go to the job's GPUs, and the particle files are read with up to 8 of the job's CPU cores.
       Submit it from this folder in the pyDynamo shell (<span class="mono">prototype/bin/pydynamo-shell</span>: pyDynamo's environment, no SBGrid, with Slurm's commands); the job gets that environment, and its output goes to <span class="mono">slurm-&lt;job id&gt;.out</span> here; the project's own <span class="mono">log.txt</span> is written as usual.</div></div>`;
 }
 function ramNote(st) {
   const gb = particlesGB(st), df = st.data_facts || {};
   const est = SL.memSet ? "" : gb ? ` The value is estimated from the data: pyDynamo keeps the ${df.N} particles in RAM during the alignment (${gb < 0.1 ? "under 0.1" : gb.toFixed(1)} GB as float32) and holds twice that while reading them, plus a margin of 4 GB per GPU process.` : "";
-  return `<b>RAM</b> is the job's main memory (<span class="mono">--mem</span>), not GPU memory: GPU memory is not asked for, because the job's GPUs are its own, whole, with all their memory.${est} Slurm may stop a job that needs more RAM than it asked for; without <span class="mono">--mem</span> it would give the job all of its machine's memory (this cluster sets no default).`;
+  return `<b>RAM</b> is the job's main memory (<span class="mono">--mem</span>), not GPU memory: GPU memory is not asked for, because the job's GPUs are its own, whole, with all their memory.${est} Slurm may stop a job that needs more RAM than it asked for; without <span class="mono">--mem</span> it would give the job all of its machine's memory (unless the cluster sets a default with DefMemPerCPU / DefMemPerNode).`;
 }
 function slurmPaint() {
   const line = slurmLine(S.st);
@@ -1016,7 +1016,7 @@ function fsPaint() {
   }
   sp.innerHTML = html;
 }
-// paths relative to the project folder, absolute when outside it (as the Tk view's browse)
+// paths relative to the project folder, absolute when outside it
 function fsJoin(name) { return FS.rel.startsWith("..") ? FS.path + "/" + name : (FS.rel === "." ? "" : FS.rel + "/") + name; }
 function fsHere() { return FS.rel.startsWith("..") ? FS.path : FS.rel; }
 

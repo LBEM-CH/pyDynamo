@@ -127,27 +127,27 @@ def _rows(tilt_cur, tilt_prev, az_cur=0.0, az_prev=0.0):
 
 def test_column28_d_symmetry_fold():
     """dynamo_rigid_compare.m:117-127: for kind 'd' an axis difference above 90 degrees is folded by 180."""
-    from pydyn.dynproject import NumpyTrig, compare_columns
+    from pydyn.dynproject import FdlibmTrig, compare_columns
     cur, prev = _rows(0.0, 150.0)
-    _, c28, _, _ = compare_columns(cur, prev, NumpyTrig, 1.0)
+    _, c28, _, _ = compare_columns(cur, prev, FdlibmTrig, 1.0)
     assert abs(c28[0].real - 150.0) < 1e-9
-    _, c28d, _, _ = compare_columns(cur, prev, NumpyTrig, 2.0, sym_kind="d")
+    _, c28d, _, _ = compare_columns(cur, prev, FdlibmTrig, 2.0, sym_kind="d")
     assert abs(c28d[0].real - (-30.0)) < 1e-9
-    _, c28c, _, _ = compare_columns(cur, prev, NumpyTrig, 3.0, sym_kind="c")
+    _, c28c, _, _ = compare_columns(cur, prev, FdlibmTrig, 3.0, sym_kind="c")
     assert abs(c28c[0].real - 150.0) < 1e-9                       # only kind 'd' folds
 
 
 def test_helical_dphi_zero_gives_abs_dnarot():
     """rigid_compare.m:87/113: 360/0 = Inf, mod(x, 0) = x, column 29 = |dnarot| (no ZeroDivisionError)."""
-    from pydyn.dynproject import NumpyTrig, compare_columns, matlab_mod
+    from pydyn.dynproject import FdlibmTrig, compare_columns, matlab_mod
     from pydyn.symmetry import symorder
     so = symorder("h[0,0.3]")
     assert so == float("inf")
     cur, prev = _rows(10.0, 10.0, az_cur=-37.0, az_prev=5.0)       # dnarot = (-(-37)) - (-5) = 42
-    _, _, c29, _ = compare_columns(cur, prev, NumpyTrig, so)
+    _, _, c29, _ = compare_columns(cur, prev, FdlibmTrig, so)
     assert abs(c29[0] - 42.0) < 1e-12
     cur[0, 6] = 37.0                                               # dnarot = -37 - (-5) = -32
-    _, _, c29, _ = compare_columns(cur, prev, NumpyTrig, so)
+    _, _, c29, _ = compare_columns(cur, prev, FdlibmTrig, so)
     assert abs(c29[0] - 32.0) < 1e-12
     assert np.array_equal(matlab_mod(np.array([-3.0, 4.5]), 0.0), [-3.0, 4.5])
 
@@ -171,38 +171,6 @@ def test_mask_size_from_a_file(tmp_path):
     assert list(_size_argument(vol)) == [7, 6, 5]
     with pytest.raises(FileNotFoundError, match="cannot find requested file"):
         dynamo_mask("size", str(tmp_path / "missing.em"), "type", "cylinder")
-
-
-# ------------------------------------------------------------------------------------------------ L4 prepare_template
-def test_prepare_template_sym_step_follows_volume_process(monkeypatch):
-    """DVP:432-433: dynamo_sym(map, sym, 'fmask', fmask) only with symmetrize_with_fmask, else dynamo_sym(map, sym);
-    the fmask is the binarised starting fmask, not the 'full -> ones' replacement of the transformed fmask."""
-    from pydyn import reference as R
-    calls = []
-
-    def fake(vol, sym, fmask=None):
-        calls.append(None if fmask is None else np.asarray(fmask).copy())
-        return vol, fmask
-    monkeypatch.setattr(R, "symmetrize", fake)
-    rng = np.random.RandomState(0)
-    v = rng.rand(16, 16, 16)
-    mask = np.ones((16, 16, 16))
-    full = np.ones((16, 16, 16)) * 0.9                              # a 'full' fmask: ones in the sphere
-    R.prepare_template(v, mask, "c3", 2, 6, full)
-    R.prepare_template(v, mask, "c3", 2, 6, full, symmetrize_with_fmask=False)
-    R.prepare_template(v, mask, "c3", 2, 6, None)
-    assert np.array_equal(calls[0], np.ones((16, 16, 16), np.float32)) and calls[0].dtype == np.float32
-    assert calls[1] is None and calls[2] is None
-    half = full.copy()
-    half[:4] = 0.1
-    R.prepare_template(v, mask, "c3", 2, 6, half)
-    assert calls[3][:4].sum() == 0 and calls[3][4:].min() == 1      # binarised, not replaced by ones
-
-
-def test_pydyn_run_finalize_passes_sym():
-    src = open(os.path.join(P, "prototype", "pydyn_run.py")).read()
-    assert "finalize([r[\"partial\"] for r in res], mask_raw, n, sym=a.sym)" in src
-    assert "symmetrize_with_fmask=bool(a.symmetrize_with_fmask)" in src
 
 
 # ------------------------------------------------------------------------------------------------ L6
@@ -305,7 +273,7 @@ def test_dynamo_execute_project_console_script_and_function(capsys, tmp_path, mo
     monkeypatch.setattr("pydyn.execute.execute_project", lambda name, **kw: ns.append((name, kw)) or True)
     assert cli.execute_main(["p", "--gpus", "1,2", "--engine", "fast", "--exact-sms", "64", "--iterations", "3",
                              "--report", "/x/r.json"]) == 0
-    assert ns == [("p", dict(gpus=[1, 2], matlab_trig=False, keep_temp=False, iterations=3, engine="fast",
+    assert ns == [("p", dict(gpus=[1, 2], keep_temp=False, iterations=3, engine="fast",
                              exact_sms=64, report="/x/r.json"))]
 
 
@@ -397,16 +365,9 @@ def test_mask_editor_show_and_view(tmp_path, monkeypatch):
     assert rec.calls[-1][0][:2] == ["view", "t.em"]
 
 
-def test_gui_menus_are_wired(monkeypatch):
-    """The Tk view (needs a display to run) calls the controller methods above."""
-    import inspect
-    from pydyn import gui
-    src = inspect.getsource(gui.DcpApp)
-    for call in ("view_last_averages", "plot_adaptive_filtering_fsc", "view_template", "plot_orientations", "view_mask",
-                 "overlay_mask", "ed.show", "ed.view_file"):
-        assert call in src, call
-    assert "Plot attained resolution FSC for all iterations" in src and "Last computed average(s)" in src
+def test_viewer_functions_are_exported():
     import pydyn
     for n in ("dmapview", "dview", "dslices", "dtplot", "dynamo_mapview", "dynamo_view", "dynamo_slices",
               "dynamo_tableplot"):
         assert n in pydyn.__all__
+

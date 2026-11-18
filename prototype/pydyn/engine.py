@@ -165,10 +165,6 @@ def _k(name):
     return _kernels[name]
 
 
-def _rot_kernel():
-    return _k("rotate_batch")
-
-
 def _launch(name, total, args):
     _k(name)(((int(total) + 255) // 256,), (256,), args)
 
@@ -653,7 +649,10 @@ class Engine:
         with cp.cuda.Stream.null:           # cuFFT 8 / cuBLAS 8 run on the legacy default stream, so do the kernels
             for p in range(len(rows)):
                 ex.record = [] if self.trace is not None else None
+                _tl = time.perf_counter()
                 ex.load_particle(self.particles_host[p])
+                if ex.htime is not None:
+                    ex.htime["load"] = ex.htime.get("load", 0.0) + time.perf_counter() - _tl
                 out[p] = ex.refine_particle(rows[p])
                 if progress:
                     progress(p + 1, out)
@@ -663,6 +662,8 @@ class Engine:
         ex.record = None
         self.orientation_counts = counts or []
         self.timings["align"] = self.timings.get("align", 0.0) + time.perf_counter() - t0
+        if ex.htime is not None:
+            self.timings["exact_host"] = {k: round(v, 3) for k, v in ex.htime.items()}
         return out
 
     def _refine(self, rows):

@@ -332,7 +332,7 @@ def hsym(vols, dphi, dz, reps, device="auto"):
 def _rot0(vol, eulers, device="auto"):
     """dynamo_rot(vol, eulers): mex option 0, outscope 0 (float64 of the float32 result)."""
     if device != "cpu" and _gpu_ok():
-        from .reference import rot_sphere0
+        from .average import rot_sphere0
         with _device_ctx():
             return rot_sphere0(vol, [eulers])[0]
     from .dalign import mex_shift_rot
@@ -374,7 +374,8 @@ def flat_weights(F):
     from .dynproject import ellipsoid_inside
     n = F.shape[0]
     inner = ellipsoid_inside(n, math.floor(n / 2 - 2 + 0.5))
-    return float(np.std(F[inner], ddof=1)) < 1e-5
+    from .matlab_numerics import mstd
+    return mstd(F[inner]) < 1e-5                                   # single-thread MATLAB std (sequential sums)
 
 
 def dynamo_sym(vol, op, fmask=None, foutput="weights", device="auto", divide="allow"):

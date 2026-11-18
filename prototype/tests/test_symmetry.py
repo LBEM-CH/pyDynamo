@@ -92,7 +92,7 @@ def test_col29_helical_fold_matches_user_table():
     prev = dynio.read_tbl(os.path.join(E, "settings/table_initial_ref_001.tbl"))
     pi = {int(t): i for i, t in enumerate(np.real(prev[:, 0]).tolist())}
     pr = np.real(prev[[pi[int(t)] for t in np.real(cur[:, 0]).tolist()]])
-    _, _, c29, _ = DP.compare_columns(np.real(cur), pr, DP.NumpyTrig(), Y.symorder(OP))
+    _, _, c29, _ = DP.compare_columns(np.real(cur), pr, DP.FdlibmTrig(), Y.symorder(OP))
     assert np.array_equal(np.array([float("%.5g" % v) for v in c29]), np.real(cur[:, 28]))
 
 
@@ -165,8 +165,8 @@ def _check_small(dev):
         assert np.array_equal(Y.dynamo_sym(v, OP, f, device=dev)[0].astype(np.float32), m["vp"].astype(np.float32))
         assert np.array_equal(Y.dynamo_sym(v, "c3", f, device=dev)[0].astype(np.float32), m["vc"].astype(np.float32))
     for op, fn in ((OP, "small_sym_h.em"), ("c3", "small_sym_c3.em"), ("d2", "small_sym_d2.em")):
-        assert md5(os.path.join(GT, fn)) and np.array_equal(
-            Y.dynamo_sym(v, op, device=dev)[0].astype(np.float32), dynio.read_em(os.path.join(GT, fn)))
+        assert np.array_equal(Y.dynamo_sym(v, op, device=dev)[0].astype(np.float32),
+                              dynio.read_em(os.path.join(GT, fn)))
 
 
 @pytest.mark.skipif(not HAVE_GT, reason="symmetry ground truth absent")

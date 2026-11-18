@@ -17,7 +17,7 @@ def webengine_problem():
         import PySide6.QtWebEngineWidgets  # noqa: F401
     except Exception as e:
         return ("Qt WebEngine is not available (%s). Install the GUI section of requirements/pydynamo-lock.txt "
-                "(PySide6-Addons) or use 'dcp --tk'." % e)
+                "(PySide6-Addons)." % e)
     return None
 
 

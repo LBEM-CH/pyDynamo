@@ -27,7 +27,6 @@ GT = os.path.join(P, "benchmarks", "05_abp_bin4_eo", "checks", "impl_gt")
 # (benchmarks/README.md, "Old names"), so that recorded form is normalised too.
 REF_RECORDED = os.path.join(P, "benchmarks", "abp", "reference")
 recorded = lambda path: path.replace(REF, REF_RECORDED)
-MCR_OK = os.path.isfile(os.path.join(DP.MCR_ROOT, "bin/glnxa64/libmwmathutil.so"))
 md5 = lambda f: hashlib.md5(open(f, "rb").read()).hexdigest()
 f2c = lambda a: np.transpose(a, (2, 1, 0))
 
@@ -316,13 +315,7 @@ def test_table_align_fmask_rotation_fsc_vs_dynamo():
     m = _gt()
     T = dynio.read_tbl(os.path.join(GT, "gt_align", "in", "refined_table_ref_002_ite_0001.tbl"))
     out = np.real(abp.table_align(T, m["r1_Tp_shifts"], m["r1_Tp_eulers"]))
-    assert np.max(np.abs(out - m["Ttab"])) < 1e-12 and dynio.tbl_bytes(out) == dynio.tbl_bytes(m["Ttab"])
-    if MCR_OK:                                        # with MATLAB's own trig: bit-identical doubles
-        try:
-            D.set_matlab_trig(True)
-            assert np.array_equal(np.real(abp.table_align(T, m["r1_Tp_shifts"], m["r1_Tp_eulers"])), m["Ttab"])
-        finally:
-            D.set_matlab_trig(False)
+    assert np.array_equal(out, m["Ttab"])              # MATLAB's trig (pydyn.fdlibm): bit-identical doubles
     F2 = dynio.read_em(os.path.join(GT, "gt_align", "in", "fmask_average_ref_002_ite_0001.em"))
     assert np.array_equal(D.mex_shift_rot(F2, m["r1_Tp_eulers"], (0, 0, 0), option=0), f2c(m["F2r"]))
     A2 = dynio.read_em(os.path.join(GT, "gt_align", "in", "average_ref_002_ite_0001.em"))
@@ -385,20 +378,16 @@ def _compare_harness(root, files):
     assert lines(os.path.join(root, "log.txt")) == lines(os.path.join(S4, "log.txt"))
 
 
-@pytest.mark.skipif(not (HAVE_HARNESS and HAVE_USER and MCR_OK), reason="ABP harness or MCR math library absent")
+@pytest.mark.skipif(not (HAVE_HARNESS and HAVE_USER), reason="ABP harness absent")
 def test_abp_harness_replay_cpu(tmp_path):
     """adaptiveFiltering on Dynamo's own ite-1 averages; the GPU re-average of reference 2 is replaced by Dynamo's
     float32 result. Every file Dynamo writes is byte-identical (card: except the test folder's path line)."""
     root = _harness(str(tmp_path))
-    proj = DP.DynamoProject(root, os.path.join(str(tmp_path), "filamentsData_ctf"), root, echo=False,
-                            matlab_trig=True)
-    try:
-        a2 = dynio.read_em(os.path.join(GT, "harness/snap4_after_abp/results/ite_0001/averages/"
-                                            "average_ref_002_ite_0001.em"))
-        proj.average_from_table = lambda ite, ref, table: {"average": a2}
-        info = abp.adaptive_filtering(proj, 1)
-    finally:
-        D.set_matlab_trig(False)
+    proj = DP.DynamoProject(root, os.path.join(str(tmp_path), "filamentsData_ctf"), root, echo=False)
+    a2 = dynio.read_em(os.path.join(GT, "harness/snap4_after_abp/results/ite_0001/averages/"
+                                        "average_ref_002_ite_0001.em"))
+    proj.average_from_table = lambda ite, ref, table: {"average": a2}
+    info = abp.adaptive_filtering(proj, 1)
     assert info["fp"] == 28 and info["new_low"] == 26 and info["next_round"] == 1
     _compare_harness(root, ("refined_table_ref_002_ite_0001.tbl", "average_not_redefined_ref_001_ite_0001.em",
                             "average_not_redefined_ref_002_ite_0001.em", "table_not_redefined_ref_002_ite_0001.em",
@@ -411,8 +400,7 @@ def test_abp_harness_replay_gpu(tmp_path):
     """Same replay with pydyn's own GPU re-average of reference 2 (genericInput2Average): the resolution, the new low
     and the vpr/card must match; the FSC curve within the averaging kernel's tolerance (08b 4.6)."""
     root = _harness(str(tmp_path))
-    proj = DP.DynamoProject(root, os.path.join(str(tmp_path), "filamentsData_ctf"), root, echo=False,
-                            matlab_trig=MCR_OK)
+    proj = DP.DynamoProject(root, os.path.join(str(tmp_path), "filamentsData_ctf"), root, echo=False)
     try:
         # the re-average needs the particles of reference 2 resident on the workers (left there by 'align' in a run)
         proj._start_workers()
@@ -421,7 +409,6 @@ def test_abp_harness_replay_gpu(tmp_path):
         info = abp.adaptive_filtering(proj, 1)
     finally:
         proj.close()
-        D.set_matlab_trig(False)
     assert info["fp"] == 28 and info["new_low"] == 26
     x = dynio.read_fsc(os.path.join(root, "results/ite_0001/averages/bandpass_fsc_ite_0001.fsc")).ravel()
     y = dynio.read_fsc(os.path.join(GT, "harness/snap4_after_abp/results/ite_0001/averages/"
@@ -524,20 +511,15 @@ def test_abp_ite4_reaverage_real_run_gpu(tmp_path):
     G = _run_sal(ite)
     tps, tpe = np.ravel(G.Tp[0, 0].shifts), np.ravel(G.Tp[0, 0].eulers)
     T_pre = dynio.read_tbl(os.path.join(RUNP, "results/ite_0005/starting_values/starting_table_ref_002_ite_0005.tbl"))
-    if MCR_OK:
-        D.set_matlab_trig(True)
+    T2 = abp.table_align(T_pre, tps, tpe)
+    shutil.copytree(os.path.join(RUNP, "settings"), str(tmp_path / "out" / "settings"))       # mask.em
+    proj = DP.DynamoProject(RUNP, os.path.join(RUN, "filamentsData_ctf"), str(tmp_path / "out"), echo=False)
     try:
-        T2 = abp.table_align(T_pre, tps, tpe)
-        shutil.copytree(os.path.join(RUNP, "settings"), str(tmp_path / "out" / "settings"))   # mask.em
-        proj = DP.DynamoProject(RUNP, os.path.join(RUN, "filamentsData_ctf"), str(tmp_path / "out"), echo=False)
-        try:
-            proj._start_workers()
-            _load_slot(proj, 2, np.real(T2))
-            A2n = proj.average_from_table(ite, 2, T2)["average"]
-        finally:
-            proj.close()
+        proj._start_workers()
+        _load_slot(proj, 2, np.real(T2))
+        A2n = proj.average_from_table(ite, 2, T2)["average"]
     finally:
-        D.set_matlab_trig(False)
+        proj.close()
     Ad = dynio.read_em(_run_av(ite, "average_ref_002_ite_0004.em")).astype(np.float64)
     assert np.max(np.abs(A2n - Ad)) < 1e-5
     A1 = dynio.read_em(_run_av(ite, "average_not_redefined_ref_001_ite_0004.em")).astype(np.float64)
@@ -554,7 +536,7 @@ HAVE_EUSER = os.path.isfile(os.path.join(EUSER, "results", "ite_0005", "starting
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not (HAVE_EUSER and MCR_OK), reason="user abp_align_eo project or MCR math library absent")
+@pytest.mark.skipif(not HAVE_EUSER, reason="user abp_align_eo project absent")
 def test_abp_helical_ite4_user_files(tmp_path):
     """adaptiveFiltering of the user's iteration 4 (sym h[-1.4,0.3], adaptive_bandpass_symmetrized 1, threshold 0.143,
     pushback 0): input = the user's averages, with ref 2's pre-ABP average (average_not_redefined) and pre-ABP table
@@ -585,7 +567,7 @@ def test_abp_helical_ite4_user_files(tmp_path):
     dynio.write_txt(str(Pp / "results" / "bandpass_resolution.txt"), res[:3].reshape(1, -1))
     fv = str(Pp / "settings" / "virtual_project.mat")
     V.write_vpr_file(fv, V.modify(V.read_vpr_file(fv), "path", str(root)))
-    proj = DP.DynamoProject(str(Pp), str(root / "filamentsData_ctf"), str(Pp), echo=False, matlab_trig=True)
+    proj = DP.DynamoProject(str(Pp), str(root / "filamentsData_ctf"), str(Pp), echo=False)
     a2n = dynio.read_em(os.path.join(EUSER, f("average", 2)))
     proj.average_from_table = lambda ite, ref, table, fsc_sym=None: {"average": a2n}
     info = abp.adaptive_filtering(proj, 4)

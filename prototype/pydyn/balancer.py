@@ -95,8 +95,3 @@ class MemoryBalancer:
                 self.batch = b
                 self.log.append({"event": "oom_backoff", "new_batch": b, "error": type(e).__name__})
         return self.batch
-
-    def peak_used_fraction(self):
-        free, total = cp.cuda.runtime.memGetInfo()
-        pool = cp.get_default_memory_pool()
-        return (total - free - pool.free_bytes()) / total if total else math.nan

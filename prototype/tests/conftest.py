@@ -14,7 +14,10 @@ def _gpu_available():
         return False
 
 
-GPU = _gpu_available()
+# GPU tests are opt-in: they run only with PYDYN_GPU_TESTS=1 (set it inside a GPU job, e.g. the Slurm sandbox), so a
+# plain `pytest` on a machine that sees a GPU never uses that GPU outside a reservation. CI has no GPU either way.
+GPU_TESTS_REQUESTED = os.environ.get("PYDYN_GPU_TESTS") == "1"
+GPU = GPU_TESTS_REQUESTED and _gpu_available()
 
 
 def _cupy_importable():
@@ -35,7 +38,8 @@ CHECK_CLEAN = ([], [], [], "none") if _cupy_importable() else (
 def pytest_collection_modifyitems(config, items):
     if GPU:
         return
-    skip = pytest.mark.skip(reason="needs CuPy and a CUDA GPU")
+    skip = pytest.mark.skip(reason="needs CuPy and a CUDA GPU" if GPU_TESTS_REQUESTED else
+                            "GPU test: set PYDYN_GPU_TESTS=1 (inside a GPU job) to run it")
     for item in items:
         if "gpu" in item.keywords:
             item.add_marker(skip)
