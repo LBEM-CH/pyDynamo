@@ -8,7 +8,10 @@ bytes in C order). No user data is involved: every input is either stored in the
 * dalign.matlab_colon: a:d:b, incl. the even-n middle element (a + (c-a)/2 for same-sign ends);
 * matlab_numerics.cmul / conj: A .* conj(B) without fused multiply-adds, conj giving +0;
 * matlab_numerics.ifftn_real: MATLAB's ifftn of a conjugate-symmetric array (needs FFTW);
-* dalign.dynamo_align on a synthetic 32^3 pair (needs FFTW).
+* dalign.dynamo_align on a synthetic 32^3 pair (needs FFTW);
+* matlab_numerics.msum: MATLAB's sum with T computational threads (n >= 89,000 chunked), T = 1 .. 64;
+* masks._FFTW fftn / ifftn on 18^3, 20^3, 21^3, 30^3, 80^3, 96^3, 128^3 and a non-cubic MATLAB size 20x18x21,
+  through the self-checked fast path and through the exact (grouped 1-D) path (needs FFTW).
 """
 import hashlib
 import json
@@ -36,14 +39,24 @@ def sha(a):
 
 # --------------------------------------------------------------------------------------- synthetic inputs (IEEE)
 def blobs(n, centres):
-    """Sum of w / (1 + r^2 / s) on the [z, y, x] grid -n/2 .. n/2-1 (only +, -, *, /)."""
-    g = np.arange(n, dtype=np.float64) - n / 2
-    z, y, x = np.meshgrid(g, g, g, indexing="ij")
-    v = np.zeros((n, n, n))
+    """Sum of w / (1 + r^2 / s) on the [z, y, x] grid -n/2 .. n/2-1 (only +, -, *, /); n or (nz, ny, nx)."""
+    shape = (n,) * 3 if np.isscalar(n) else tuple(n)
+    z, y, x = np.meshgrid(*[np.arange(k, dtype=np.float64) - k / 2 for k in shape], indexing="ij")
+    v = np.zeros(shape)
     for cx, cy, cz, s, w in centres:
         r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy) + (z - cz) * (z - cz)
         v = v + w / (1.0 + r2 / s)
     return v
+
+
+FFT_SHAPES = [(18, 18, 18), (20, 20, 20), (21, 21, 21), (30, 30, 30), (21, 18, 20),     # [z, y, x]
+              (80, 80, 80), (96, 96, 96), (128, 128, 128)]
+
+
+def fft_inputs(shape):
+    a = blobs(shape, PARTICLE)
+    b = blobs(shape, TEMPLATE)
+    return a, a + 1j * b
 
 
 PARTICLE = [(1.5, -2.0, 0.5, 6.0, 1.0), (-4.0, 3.0, -1.0, 4.0, 0.7), (3.0, 4.5, 2.5, 3.0, 0.5),
@@ -124,3 +137,54 @@ def test_dynamo_align_synthetic_bit_identical():
     assert [d2h(v) for v in s["ccmax"]] == R["ccmax"]
     assert sha(np.concatenate([np.ravel(a) for a in s["angles"]])) == R["angles_sha"]
     assert sha(np.concatenate([np.ravel(c) for c in s["cc_angles"]])) == R["cc_angles_sha"]
+
+
+@needs_fix
+@needs_fftw
+@pytest.mark.parametrize("fast", [True, False], ids=["checked-fast-path", "exact-path"])
+@pytest.mark.parametrize("shape", FFT_SHAPES, ids=lambda sh: "x".join(map(str, sh)))
+def test_fft_sizes_as_matlab(shape, fast):
+    """MATLAB's grouped 1-D FFTs (pydyn.masks._FFTW) on sizes that are not powers of two (and one non-cubic
+    shape): fftn of a real array, ifftn of a symmetric spectrum and of a product spectrum, ifftn of a complex
+    array. With fast=True the whole-volume plans are used only where the self-check proves them identical."""
+    from pydyn import masks as M
+    b = M._BACKEND["b"]
+    keep = b.FAST
+    b.FAST = fast
+    try:
+        a, q = fft_inputs(shape)
+        F = MN.fftn(a)
+        R = REF["fft_shapes"]["x".join(map(str, shape))]
+        assert sha(np.concatenate([F.real.ravel(), F.imag.ravel()])) == R["fftn"]
+        assert sha(MN.ifftn_real(F)) == R["ifftn_sym"]
+        Y = MN.ifftn(q)
+        assert sha(np.concatenate([Y.real.ravel(), Y.imag.ravel()])) == R["ifftn"]
+        assert sha(MN.ifftn_real(MN.cmul(F, MN.conj(MN.fftn(a * a))))) == R["product_sym"]
+    finally:
+        b.FAST = keep
+
+
+def sum_input(n):
+    """The vector of benchmarks/15_fft_sizes/sums (only *, /, -, + and fmod, exact in IEEE)."""
+    t = np.arange(n, dtype=np.float64)
+    return ((t * 7919.0) % 10007.0) / 10007.0 - 0.37 + ((t * 104729.0) % 1009.0) * 1e-7
+
+
+@needs_fix
+def test_msum_threads_as_matlab():
+    R = REF["msum_threads"]
+    x = sum_input(max(R["n"]))
+    for n, row in zip(R["n"], R["sum"]):
+        for T, h in zip(R["threads"], row):
+            assert MN.msum(x[:n], T) == h2d(h), (n, T)
+    assert MN.msum(x[:100000], 16) != MN.msum(x[:100000], 1)               # the thread count does change the bits
+
+
+def test_matlab_threads_override(monkeypatch):
+    monkeypatch.setenv("PYDYN_MATLAB_THREADS", "64")
+    assert MN.matlab_threads() == 64
+    monkeypatch.delenv("PYDYN_MATLAB_THREADS")
+    assert 1 <= MN.matlab_threads() <= (os.cpu_count() or 1)
+    monkeypatch.setenv("PYDYN_MATLAB_THREADS", "0")
+    with pytest.raises(ValueError):
+        MN.matlab_threads()

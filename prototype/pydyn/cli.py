@@ -72,6 +72,10 @@ def _execute_args(e):
     e.add_argument("--exact-sms", type=int, default=None,
                    help="exact engine: reproduce the cuBLAS 8 reduction order of a GPU with this many SMs, e.g. 64 for "
                         "an RTX A5000 (Dynamo's tables depend on the GPU model through it); default: the GPU in use")
+    e.add_argument("--matlab-threads", type=int, default=None,
+                   help="MATLAB thread count of the Dynamo run to reproduce, for the adaptive bandpass realignment (Dynamo "
+                        "runs it with one thread per core of its job, e.g. 64 on a whole 64-core node). Default: "
+                        "$PYDYN_MATLAB_THREADS, else one per physical core available here, as MATLAB")
     e.add_argument("--keep-temp", action="store_true")
     e.add_argument("--iterations", type=int, default=None, help="stop after this iteration")
     e.add_argument("--report", default=None, metavar="PATH",
@@ -82,7 +86,8 @@ def _run_execute(a):
     from .execute import execute_project
     gpus = "all" if a.gpus == "all" else ([int(g) for g in a.gpus.split(",")] if a.gpus else None)
     ok = execute_project(a.name, gpus=gpus, keep_temp=a.keep_temp,
-                         iterations=a.iterations, engine=a.engine, exact_sms=a.exact_sms, report=a.report)
+                         iterations=a.iterations, engine=a.engine, exact_sms=a.exact_sms, report=a.report,
+                         matlab_threads=a.matlab_threads)
     return 0 if ok else 1
 
 

@@ -4,10 +4,11 @@
 projects, the GPU alignment and the averaging) in Python, without MATLAB. The tables, averages and cards it writes are
 bit-identical to Dynamo's in these conditions: the exact engine runs on the same GPU model (or with `--exact-sms`),
 and an FFTW 3 library is available. The `.exe` is byte-identical, and `log.txt` follows Dynamo's line by line.
-With adaptive_bandpass = 1, the realignment of reference 2 (`pydyn/dalign.py`) is bit-identical to Dynamo run on
-the same machine; Dynamo's own result for this step differs between machines by up to about 1e-12 (measured), so a
-project computed by Dynamo elsewhere can differ there in the last digits. Box sizes that are not a power of two are
-not verified: MATLAB's FFTs of 45^3, 48^3 and 50^3 arrays differ from pyDynamo's FFTW calls.
+With adaptive_bandpass = 1, Dynamo realigns reference 2 inside `dynamo_execute_project`, which MATLAB runs with one
+thread per core of the job, and MATLAB's sums change with the thread count. pyDynamo reproduces it with
+`--matlab-threads N` (default: one per physical core available, as MATLAB; e.g. 64 for a Dynamo run on a whole
+64-core node), measured bit-identical for 16 and 64 threads. MATLAB's own `fftn` / `ifftn` calls are reproduced bit
+for bit (measured for boxes 16 to 320, odd, non-power-of-two and non-cubic sizes).
 
 Names: **pyDynamo** is the project (MIT licence, see `LICENSE` and `NOTICE`). **pydyn** is the Python package
 (`prototype/pydyn`). **pydynamo** is the environment (`.envs/pydynamo`) and also the console command. Paths below are
@@ -162,12 +163,15 @@ at the end of each iteration's assembly.
 
 ### Averaging
 
-The averages are bit-identical to Dynamo's single-threaded MATLAB, because Dynamo's executables run MATLAB with
-`-singleCompThread`. pyDynamo reproduces this in four ways:
+The averages are bit-identical to Dynamo's single-threaded MATLAB: Dynamo's kernel executables (set-up, compute,
+assemble) run MATLAB with `-singleCompThread`. pyDynamo reproduces this in four ways:
 - it uses sequential double sums (`pydyn/matlab_numerics.py`);
 - it adds the particles in ascending tag order and passes one running state through the GPU workers;
 - it normalises each particle with MATLAB's sums;
-- it computes `fftn` / `ifftn` with FFTW, as MATLAB does.
+- it computes `fftn` / `ifftn` with MATLAB's own sequence of FFTW calls (1-D transforms one dimension at a time,
+  4 lines per plan, read from MATLAB with an FFTW call logger; `pydyn/masks.py`).
+`dynamo_execute_project` itself, where the adaptive bandpass runs, is compiled without that flag; see
+`--matlab-threads` above.
 
 FFTW is loaded through ctypes: `$PYDYN_FFTW_LIB` if it is set (then only that library is tried), else the system's
 `libfftw3.so.3`. No MATLAB library is used. In measurements, the system FFTW 3.3.8 gave the same bits as MATLAB's own

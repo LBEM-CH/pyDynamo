@@ -6,7 +6,7 @@ of their half (odd/even by position in the ascending tag list):
 * C = number of NaN contributions per voxel;
 * F = sum of rotated wedges / Ntags.
 The project runner chains one state through its GPU workers in tag order, so each half is one sequential double
-sum as in dynamo_average's single-thread MATLAB loop (Dynamo's executables run -singleCompThread); the per-particle
+sum as in dynamo_average's single-thread MATLAB loop (dynamo_iteration_assemble runs -singleCompThread); the per-particle
 normalisation uses MATLAB's sequential sums (pydyn.matlab_numerics), and the FFTs are MATLAB's FFTW. Checked byte
 for byte against the user's Dynamo averages (benchmarks/12_avg_order). `finalize` computes the outputs Dynamo
 writes: average, average_unweighted, fweight_average_raw, fmask_average and eo_fsc.
@@ -59,12 +59,10 @@ def wedge_mask(n, row):
     type 2 (tilt about x): range cols 16-17, eulers [90, 0, 0] (dynamo_wedge_mask.m:198-199)."""
     ftype = int(row[12])
     if ftype == 0:
-        W = np.ones((n, n, n), dtype=np.float32)
-        c = n // 2
-        r = np.arange(n, dtype=np.float32) - np.float32(c)
-        rz, ry, rx = np.meshgrid(r, r, r, indexing="ij")
-        W[(rx * rx + ry * ry + rz * rz) / np.float32((c + 0.5) ** 2) >= 1] = 0
-        return W
+        # full sampling: dynamo_fsampling(l, 'kind', 'full') -> ones(l, l, l) (dynamo_average.m:2740,
+        # dynamo_fsampling_forcemap.m 'full'); only the rotation's implicit sphere (rot_mex0) crops it. A cube
+        # pre-cropped by a sphere differs after rotation (about 1,860 voxels of a 48^3 weight, up to 0.35).
+        return np.ones((n, n, n), dtype=np.float32)
     if ftype == 1:
         return _fill_wedge(n, row[13], row[14], (0.0, 0.0, 0.0))
     if ftype == 2:

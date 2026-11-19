@@ -20,13 +20,15 @@ def _bars(n=80):
 
 
 def execute_project(name, gpus=None, destination=None, keep_temp=False, iterations=None,
-                    engine=None, exact_sms=None, report=None):
+                    engine=None, exact_sms=None, report=None, matlab_threads=None):
     """dynamo_execute_project(name): run the unfolded project ./<name> from the current folder.
     gpus: physical device ids to use (default: the vpr's gpu_identifier_set), or "all": every visible GPU, up to
     the number of particle parts (pyDynamo option for Slurm jobs). engine: 'exact' or 'fast' GPU
     alignment engine (pydyn.engine.engine_mode; default $PYDYN_ENGINE, else pydyn.engine.DEFAULT_ENGINE).
     exact_sms: exact engine only, reproduce the cuBLAS 8 reduction order of a GPU with this many SMs.
     report: opt-in JSON diagnostics path ($PYDYN_REPORT), refused inside the project folder.
+    matlab_threads: MATLAB thread count of Dynamo's dynamo_execute_project to reproduce (adaptive bandpass
+    realignment; default: one per available physical core, as MATLAB; $PYDYN_MATLAB_THREADS).
     Returns True when the loop ends normally (o.ok), False when Dynamo would print a message and return."""
     from .engine import preflight
     preflight(engine)                                # before any project, setup or engine work (review M1)
@@ -100,7 +102,7 @@ def execute_project(name, gpus=None, destination=None, keep_temp=False, iteratio
     data = vpr["folder_data"]
     data = data if os.path.isabs(data) else os.path.abspath(data)
     pr = DynamoProject(root, data, root, gpus=ids, keep_temp=keep_temp, engine=engine,
-                       exact_sms=exact_sms, report=report)
+                       exact_sms=exact_sms, report=report, matlab_threads=matlab_threads)
     pr.run(iterations=iterations)
     return True
 

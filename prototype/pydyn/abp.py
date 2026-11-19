@@ -236,7 +236,10 @@ def adaptive_filtering(proj, ite):
         template, particle = _sym(template, op), _sym(particle, op)
     o("Aligning reference 2 onto reference 1 before computing resolution.")
     mask = dynio.read_em(_read_rel(proj, str(vpr["file_mask"])))     # dynamo_align: q.mask = vpr.file_mask
-    sal = dalign.dynamo_align(particle, template, vpr, this_round, mask=mask)
+    # the plugin runs inside dynamo_execute_project, which MATLAB runs with its default thread count (one per core),
+    # unlike the single-threaded kernel executables; the sums of dynamo_align depend on it (pydyn.matlab_numerics)
+    threads = getattr(proj, "matlab_threads", None) or MN.matlab_threads()
+    sal = dalign.dynamo_align(particle, template, vpr, this_round, mask=mask, threads=threads)
     o("... done")
     o(" shifts on reference 2: ")                                    # '%5.2 ' prints nothing (09b 4.3)
     o(" angles on reference 2: ")

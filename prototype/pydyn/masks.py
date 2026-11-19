@@ -22,11 +22,10 @@ write. Measured against headless Dynamo dumps (benchmarks/06_abp_align_eo/implB,
 
 * exp: matlab_exp below (fdlibm e_exp.c, vectorised) is bit-identical to MATLAB on all 262,144 blob arguments;
   numpy / glibc exp differ there by +-1 ulp in 24,518 values;
-* fftn(real 3-D) = FFTW r2c 3-D (FFTW_ESTIMATE) + Hermitian completion: bit-identical to MATLAB;
-* ifftn(F) for the product spectrum: MATLAB tests F for exact conjugate symmetry; a symmetric F (as here) is
-  inverted as ifft along x and y (complex) and a complex-to-real ifft along z, any other F by the complex backward
-  3-D transform, real part, / N (_FFTW.ifftn_real). Bit-identical to MATLAB (for the mask-editor spectrum both
-  orders give the same bits; for a particle spectrum of dynamo_align only MATLAB's order does);
+* fftn / ifftn: MATLAB R2019a's own sequence of FFTW calls (_FFTW.fftn_real / ifftn / ifftn_real, read from
+  MATLAB with an FFTW call logger, benchmarks/15_fft_sizes): 1-D plans along one dimension at a time, 4 lines per
+  execution; a symmetric spectrum (as here) is inverted with a complex-to-real last step. Bit-identical to MATLAB
+  (measured for boxes 16 to 320 incl. odd and non-cubic sizes; plan pattern logged for 8 to 512);
 * with both, a real dcp mask-editor mask is reproduced byte for byte with the system FFTW 3.3.8 (libfftw3.so.3),
   exactly as with MATLAB's own FFTW 3.3.3; the averaging (pydyn.matlab_numerics) is bit-identical with it too. With numpy / scipy.fft only the voxels with
   |v| > 1e-6 are bit-identical (max |diff| below 1e-15 before the float32 write).
@@ -73,7 +72,9 @@ def default_mask(l):
 
 # ===================================================================================================== FFT backend
 class _FFTW:
-    """Minimal ctypes binding of FFTW 3 (double): r2c 3-D and complex 3-D, FFTW_ESTIMATE, single thread."""
+    """ctypes binding of FFTW 3 (double, FFTW_ESTIMATE, one thread) and MATLAB R2019a's fftn / ifftn on it
+    (fftn_real, ifftn, ifftn_real; see the section below). Those three hold a lock; the whole-volume helpers
+    (rfftn_full, cfftn, cfft_axis, c2r_axis0) are only called through them."""
     ESTIMATE = 1 << 6
     FORWARD, BACKWARD = -1, 1
 
@@ -86,6 +87,8 @@ class _FFTW:
         except (ValueError, AttributeError):
             self.version = "unknown version"
         self._keep = []
+        import threading
+        self._lock = threading.RLock()                     # FFTW planning is not thread-safe; plan buffers are shared
         if hasattr(lib, "fftw_set_malloc_fcn"):
             # the MathWorks build routes fftw_malloc through hooks that MATLAB installs; without MATLAB they are
             # unset (fftw_malloc segfaults), so install aligned libc allocators
@@ -120,7 +123,8 @@ class _FFTW:
         return raw[off:off + n].view(dtype).reshape(shape)
 
     def rfftn_full(self, x):
-        """MATLAB fftn of a real 3-D array: r2c, then the conjugate-symmetric half."""
+        """Whole-volume r2c 3-D plus conjugate completion: the fast candidate of fftn_real, MATLAB's bits only where
+        _fast_ok('fftn', shape) proved it (e.g. 32^3, 64^3, 128^3; not 48^3, 96^3, 256^3). Use fftn_real."""
         x = np.ascontiguousarray(x, dtype=np.float64)
         n0, n1, n2 = x.shape
         a = self._aligned(x.shape, np.float64)
@@ -203,21 +207,270 @@ class _FFTW:
         self.lib.fftw_destroy_plan(p)
         return o.copy()
 
+    # ---------------------------------------------------------------- MATLAB R2019a's fftn / ifftn (libmwmfl_fft)
+    # Read with an LD_PRELOAD logger of its FFTW calls (benchmarks/15_fft_sizes/fftw_shim.c): MATLAB transforms one
+    # dimension at a time with 1-D plans (guru64, FFTW_ESTIMATE, one thread) made on buffers aligned 16 bytes past
+    # a 64-byte boundary, for 4 lines at a time (howmany 4) and for single left-over lines (howmany 1). The lines
+    # are grouped 4 by 4 along dim 1 over all columns, along dim 2 over x within each z slice, and along dim 3 over
+    # the flattened (x, y) index. ifft divides each part by n after each dimension. Which 1-D plan transforms a
+    # line decides its bits for sizes that are not powers of two.
+    GROUP = 4
+
+    def _plan1(self, kind, n, hm, sign):
+        """Cached 1-D plan ('c2c', 'r2c', 'c2r') of length n for hm contiguous lines, planned like MATLAB on
+        buffers at 16 mod 64; returns (plan, in buffer, out buffer)."""
+        if not hasattr(self, "_p1"):
+            self._p1 = {}
+            class IO64(ctypes.Structure):
+                _fields_ = [("n", ctypes.c_ssize_t), ("is_", ctypes.c_ssize_t), ("os_", ctypes.c_ssize_t)]
+            vp, ci, cu, pio = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.POINTER(IO64)
+            for nm, extra in (("fftw_plan_guru64_dft", [ci, cu]), ("fftw_plan_guru64_dft_r2c", [cu]),
+                              ("fftw_plan_guru64_dft_c2r", [cu])):
+                fn = getattr(self.lib, nm)
+                fn.restype = vp
+                fn.argtypes = [ci, pio, ci, pio, vp, vp] + extra
+            for nm in ("fftw_execute_dft", "fftw_execute_dft_r2c", "fftw_execute_dft_c2r"):
+                getattr(self.lib, nm).argtypes = [vp, vp, vp]
+                getattr(self.lib, nm).restype = None
+            self._io64 = IO64
+        key = (kind, n, hm, sign)
+        if key not in self._p1:
+            IO64, h = self._io64, n // 2 + 1
+            nin, nout = {"c2c": (n, n), "r2c": (n, h), "c2r": (h, n)}[kind]
+            tin = np.float64 if kind == "r2c" else np.complex128
+            tout = np.float64 if kind == "c2r" else np.complex128
+            a, o = self._aligned16((hm, nin), tin), self._aligned16((hm, nout), tout)
+            d = (IO64 * 1)(IO64(n, 1, 1))
+            m = (IO64 * 1)(IO64(hm, nin, nout))
+            if kind == "c2c":
+                p = self.lib.fftw_plan_guru64_dft(1, d, 1, m, a.ctypes.data, o.ctypes.data, sign, self.ESTIMATE)
+            elif kind == "r2c":
+                p = self.lib.fftw_plan_guru64_dft_r2c(1, d, 1, m, a.ctypes.data, o.ctypes.data, self.ESTIMATE)
+            else:
+                p = self.lib.fftw_plan_guru64_dft_c2r(1, d, 1, m, a.ctypes.data, o.ctypes.data, self.ESTIMATE)
+            if not p:
+                raise RuntimeError("FFTW could not plan %s n=%d howmany=%d" % (kind, n, hm))
+            self._p1[key] = (p, a, o)
+        return self._p1[key]
+
+    @staticmethod
+    def _aligned16(shape, dtype, zero=True):
+        """Array whose data start 16 bytes past a 64-byte boundary (MATLAB's FFT buffers); zeroed unless zero=False."""
+        dtype = np.dtype(dtype)
+        n = int(np.prod(shape)) * dtype.itemsize
+        raw = (np.zeros if zero else np.empty)(n + 128, dtype=np.uint8)
+        off = ((-raw.ctypes.data) % 64) + 16
+        return raw[off:off + n].view(dtype).reshape(shape)
+
+    def _lines(self, X, kind, sign, n, block):
+        """Transform the rows of X ([lines, len], C order, data at 16 mod 64) as MATLAB does: 4 consecutive rows
+        per execution of the howmany-4 plan, restarting at every multiple of `block` rows; left-over rows one by
+        one. Returns a new array (at 16 mod 64)."""
+        nl = X.shape[0]
+        h = n // 2 + 1
+        nout = {"c2c": n, "r2c": h, "c2r": n}[kind]
+        tout = np.float64 if kind == "c2r" else np.complex128
+        Y = self._aligned16((nl, nout), tout, zero=False)
+        ex = {"c2c": self.lib.fftw_execute_dft, "r2c": self.lib.fftw_execute_dft_r2c,
+              "c2r": self.lib.fftw_execute_dft_c2r}[kind]
+        xb, yb = X.ctypes.data, Y.ctypes.data
+        xs, ys = X.strides[0], Y.strides[0]
+        g = self.GROUP
+        p4 = self._plan1(kind, n, g, sign)[0] if block >= g else None
+        p1, a1, o1 = self._plan1(kind, n, 1, sign)
+        for b0 in range(0, nl, block):
+            s, end = b0, b0 + block
+            while s + g <= end:
+                ip, op = xb + s * xs, yb + s * ys
+                if ip % 32 == 16 and op % 32 == 16:                 # the planning alignment: run in place
+                    ex(p4, ip, op)
+                else:
+                    _, a4, o4 = self._plan1(kind, n, g, sign)
+                    a4[...] = X[s:s + g]
+                    ex(p4, a4.ctypes.data, o4.ctypes.data)
+                    Y[s:s + g] = o4
+                s += g
+            while s < end:
+                ip, op = xb + s * xs, yb + s * ys
+                if ip % 32 == 16 and op % 32 == 16:
+                    ex(p1, ip, op)
+                else:
+                    a1[0] = X[s]
+                    ex(p1, a1.ctypes.data, o1.ctypes.data)
+                    Y[s] = o1[0]
+                s += 1
+        return Y
+
+    def _stage(self, V, axis, dtype):
+        """V [z, y, x] -> rows of lines along `axis` at 16 mod 64, in MATLAB's line order: axis 2 rows (z, y);
+        axis 1 rows (z, x); axis 0 rows (y, x). Copied slice by slice (2-D transposes stay in cache)."""
+        nz, ny, nx = V.shape
+        if axis == 2:
+            X = self._aligned16((nz, ny, nx), dtype, zero=False)
+            X[...] = V
+        elif axis == 1:
+            X = self._aligned16((nz, nx, ny), dtype, zero=False)
+            for z in range(nz):
+                X[z] = V[z].T
+        else:
+            X = self._aligned16((ny, nx, nz), dtype, zero=False)
+            for y in range(ny):
+                X[y] = np.ascontiguousarray(V[:, y, :]).T     # contiguous slab first: no 1-MB-stride gathers
+        return X
+
+    @staticmethod
+    def _unstage(Y, axis):
+        """Inverse of _stage for the transformed rows Y (3-D, last axis = the transformed line)."""
+        if axis == 2:
+            return Y
+        if axis == 1:
+            nz, nx, m = Y.shape
+            out = np.empty((nz, m, nx), Y.dtype)
+            for z in range(nz):
+                out[z] = Y[z].T
+            return out
+        ny, nx, m = Y.shape
+        out = np.empty((m, ny, nx), Y.dtype)
+        for y in range(ny):
+            out[:, y, :] = Y[y].T
+        return out
+
+    def _along(self, V, axis, kind, sign):
+        """MATLAB's 1-D transforms of the [z, y, x] array V along axis (2 = MATLAB dim 1, 1 = dim 2, 0 = dim 3),
+        unnormalised; lines grouped 4 by 4 over all columns (axis 2), over x within each z slice (axis 1), over the
+        flattened (x, y) index (axis 0)."""
+        nz, ny, nx = V.shape
+        n = V.shape[axis]
+        X = self._stage(V, axis, np.float64 if kind == "r2c" else np.complex128)
+        block = {2: nz * ny, 1: nx, 0: ny * nx}[axis]
+        Y = self._lines(X.reshape(-1, n), kind, sign, n, block)
+        return self._unstage(Y.reshape(X.shape[0], X.shape[1], -1), axis)
+
+    @staticmethod
+    def _complete_x(H, nx):
+        """Full x lines from r2c halves: F[k] = conj(H[nx - k]) per line."""
+        nz, ny, h = H.shape
+        F = np.empty((nz, ny, nx), np.complex128)
+        F[:, :, :h] = H
+        if nx - h > 0:
+            F[:, :, h:] = np.conj(H[:, :, 1:nx - h + 1][:, :, ::-1])
+        return F
+
+    @staticmethod
+    def _hermitize(G):
+        """MATLAB's real fftn output: the redundant half replaced by conjugate mirrors of the computed one (z > n/2;
+        then y > n/2 in the planes z = 0, n/2; then x > n/2 on the lines with z, y in {0, n/2}), and an imaginary
+        part of exactly 0 at the self-conjugate points."""
+        S = G.copy()
+        nz, ny, nx = S.shape
+        mz, my, mx = ((-np.arange(k)) % k for k in (nz, ny, nx))
+        hz, hy, hx = nz // 2 + 1, ny // 2 + 1, nx // 2 + 1
+        selfs = lambda k: [0] + ([k // 2] if k % 2 == 0 else [])
+        if hz < nz:
+            S[hz:] = np.conj(G[mz[hz:]][:, my][:, :, mx])
+        for z0 in selfs(nz):
+            if hy < ny:
+                S[z0, hy:] = np.conj(G[z0, my[hy:]][:, mx])
+            for y0 in selfs(ny):
+                if hx < nx:
+                    S[z0, y0, hx:] = np.conj(G[z0, y0, mx[hx:]])
+                for x0 in selfs(nx):
+                    S[z0, y0, x0] = complex(S[z0, y0, x0].real, 0.0)
+        return S
+
+    @staticmethod
+    def _div(V, n):
+        """MATLAB complex ./ real scalar: each part divided."""
+        out = np.empty(V.shape, np.complex128)
+        out.real = V.real / n
+        out.imag = V.imag / n
+        return out
+
+    def _fftn_real_exact(self, x):
+        """MATLAB fftn of a real 3-D array: r2c along x and per-line completion, c2c along y and z, then the
+        conjugate mirroring of _hermitize."""
+        F = self._complete_x(self._along(x, 2, "r2c", 0), x.shape[2])
+        F = self._along(F, 1, "c2c", self.FORWARD)
+        F = self._along(F, 0, "c2c", self.FORWARD)
+        return self._hermitize(F)
+
+    def _ifftn_exact(self, V):
+        """MATLAB ifftn of a 3-D array that is not conjugate-symmetric: ifft along x, y, z, each / n."""
+        for ax in (2, 1, 0):
+            V = self._div(self._along(V, ax, "c2c", self.BACKWARD), V.shape[ax])
+        return V
+
+    def _ifftn_sym_exact(self, V):
+        """MATLAB ifftn of a conjugate-symmetric 3-D array (real result): ifft along x and y (complex), then a
+        complex-to-real ifft along z, each / n."""
+        nz = V.shape[0]
+        A = self._div(self._along(V, 2, "c2c", self.BACKWARD), V.shape[2])
+        A = self._div(self._along(A[: nz // 2 + 1], 1, "c2c", self.BACKWARD), V.shape[1])
+        X = self._stage(A, 0, np.complex128)               # lines along z (planes 0..nz/2), rows ordered (y, x)
+        Y = self._lines(X.reshape(-1, X.shape[2]), "c2r", 0, nz, V.shape[1] * V.shape[2])
+        return self._unstage(Y.reshape(X.shape[0], X.shape[1], nz), 0) / nz
+
+    # the same results through whole-volume plans (fast); used for a shape only after _fast_ok proved them
+    # bit-identical to the exact path on that shape (they are for 64^3, not for 45^3, 48^3, 50^3)
+    def _fftn_real_fast(self, x):
+        return self.rfftn_full(x)
+
+    def _ifftn_fast(self, V):
+        return self._div(self.cfftn(V, self.BACKWARD), V.size)
+
+    def _ifftn_sym_fast(self, V):
+        n0 = V.shape[0]
+        A = self.cfft_axis(V[: n0 // 2 + 1], 2, self.BACKWARD)
+        A = self.cfft_axis(A, 1, self.BACKWARD)
+        return self.c2r_axis0(A, n0) / V.size
+
+    FAST = True                                             # False: always the exact (grouped 1-D) path
+
+    def _fast_ok(self, op, shape):
+        """Once per (operation, shape): do the whole-volume plans give exactly the bits of MATLAB's grouped 1-D
+        transforms? Checked on a random input (the FFT arithmetic does not depend on the data, so one generic
+        input decides); the answer is cached."""
+        if not self.FAST:
+            return False
+        if not hasattr(self, "_fast"):
+            self._fast = {}
+        key = (op, tuple(shape))
+        if key not in self._fast:
+            rng = np.random.default_rng(20261119)
+            x = rng.standard_normal(shape)
+            if op == "fftn":
+                a, b = self._fftn_real_exact(x), self._fftn_real_fast(x)
+            elif op == "ifftn":
+                q = x + 1j * rng.standard_normal(shape)
+                a, b = self._ifftn_exact(q), self._ifftn_fast(q)
+            else:
+                F = self._fftn_real_exact(x)
+                a, b = self._ifftn_sym_exact(F), self._ifftn_sym_fast(F)
+            same = lambda u, v: np.array_equal(np.real(u).view(np.int64), np.real(v).view(np.int64))
+            self._fast[key] = bool(same(a, b) and same(np.imag(a), np.imag(b)))
+        return self._fast[key]
+
+    def fftn_real(self, x):
+        """MATLAB fftn of a real 3-D array (pydyn [z, y, x] = MATLAB (x, y, z))."""
+        x = np.ascontiguousarray(x, dtype=np.float64)
+        with self._lock:
+            return self._fftn_real_fast(x) if self._fast_ok("fftn", x.shape) else self._fftn_real_exact(x)
+
+    def ifftn(self, V):
+        """MATLAB ifftn of a 3-D array that is not conjugate-symmetric (complex result)."""
+        V = np.ascontiguousarray(V, dtype=np.complex128)
+        with self._lock:
+            return self._ifftn_fast(V) if self._fast_ok("ifftn", V.shape) else self._ifftn_exact(V)
+
     def ifftn_real(self, V):
-        """real(ifftn(V)) of a 3-D complex array as MATLAB R2019a computes it. MATLAB first tests whether V is
-        exactly conjugate-symmetric (V(k) == conj(V(-k)) for every k). If it is, the result is real and is computed
-        as ifft along MATLAB dim 1 (x) and dim 2 (y), complex, then a complex-to-real ifft along dim 3 (z), i.e.
-        ifft(ifft(ifft(V,[],1),[],2),[],3); otherwise it is the complex 3-D backward transform. Both / N.
-        Measured on Dynamo's own 64^3 inputs (benchmarks/14_msa_b4/probe): bit-identical; the 3-D complex
-        transform differs there in 164,182 of 262,144 values. Box sizes that are not powers of two are not
-        verified (MATLAB's FFTs of a 48^3, 50^3 or 45^3 array differ from these FFTW plans)."""
-        V = np.asarray(V)
-        if conj_symmetric(V):
-            n0 = V.shape[0]
-            A = self.cfft_axis(V[: n0 // 2 + 1], 2, self.BACKWARD)
-            A = self.cfft_axis(A, 1, self.BACKWARD)
-            return self.c2r_axis0(A, n0) / V.size
-        return np.real(self.cfftn(V, self.BACKWARD)) / V.size
+        """real(ifftn(V)) as MATLAB R2019a computes it. MATLAB first tests V for exact conjugate symmetry
+        (V(k) == conj(V(-k)) for every k): a symmetric V takes the real path (_ifftn_sym_exact), any other V the
+        complex ifftn, real part."""
+        V = np.ascontiguousarray(V, dtype=np.complex128)
+        if not conj_symmetric(V):
+            return np.real(self.ifftn(V))
+        with self._lock:
+            return self._ifftn_sym_fast(V) if self._fast_ok("ifftn_sym", V.shape) else self._ifftn_sym_exact(V)
 
 
 def conj_symmetric(V):
@@ -267,7 +520,7 @@ def _filter_local(a, filt):
     b = _BACKEND["b"]
     if b is not None and a.ndim == 3:
         from .matlab_numerics import cmul
-        return b.ifftn_real(cmul(b.rfftn_full(a), b.rfftn_full(fr)))
+        return b.ifftn_real(cmul(b.fftn_real(a), b.fftn_real(fr)))
     warnings.warn("pydyn.masks: no FFTW library found; dynamo_mollify uses scipy.fft. Voxels above 1e-6 are "
                   "bit-identical to Dynamo, the round-off floor below 1e-13 is not (set PYDYN_FFTW_LIB).")
     import scipy.fft as sf

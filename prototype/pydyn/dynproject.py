@@ -539,7 +539,7 @@ class DynamoProject:
     """
 
     def __init__(self, source, data, out, gpus=None, keep_temp=False, table_initial=None,
-                 echo=True, engine=None, exact_sms=None, report=None, progress_log=None):
+                 echo=True, engine=None, exact_sms=None, report=None, progress_log=None, matlab_threads=None):
         from .engine import preflight
         preflight(engine)                                            # before any project, setup or engine work (M1)
         self.source = os.path.abspath(source)
@@ -556,6 +556,10 @@ class DynamoProject:
         from .engine import engine_mode
         self.engine = engine_mode(engine)                            # GPU alignment engine: exact | fast
         self.exact_sms = exact_sms                                   # exact engine: emulate this SM count's cuBLAS 8
+        # MATLAB thread count of dynamo_execute_project, for the steps that run inside it (the adaptive bandpass's
+        # dynamo_align): default MATLAB's own, one per available physical core (pydyn.matlab_numerics.matlab_threads)
+        from .matlab_numerics import matlab_threads as _mt
+        self.matlab_threads = int(matlab_threads) if matlab_threads else _mt()
         self.trig, self.trig_name = FdlibmTrig(), "fdlibm"           # MATLAB's sin/cos, bit for bit (pydyn.fdlibm)
         # vpr.file_table_initial is relative to Dynamo's working directory, the folder that contains the project
         fti = str(self.vpr["file_table_initial"])

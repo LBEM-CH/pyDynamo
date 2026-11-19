@@ -543,10 +543,10 @@ def test_abp_helical_ite4_user_files(tmp_path):
     (starting_table_ref_002_ite_0005, propagated before ABP and untouched by a setup 5); the ref-2 re-average is the
     user's float32 average_ref_002 (the symmetrized outputs depend on float32(A2') only). Outputs vs the user's
     files: average_symmetrized / fmask_average_symmetrized of ref 2, bandpass_fsc, refined_table_ref_002,
-    table_not_redefined, bandpass_resolution.txt byte-identical; .sal Tp/ccmax to 2e-12; log lines identical.
-    The .sal is machine-dependent in Dynamo itself: Dynamo 1.1.514 run on another node (headless, one thread) with
-    the inputs stored in this .sal differs from it by up to 1.3e-12 in ccmax over iterations 1-4 (1.09e-12 here),
-    and pyDynamo's dynamo_align equals that run bit for bit (benchmarks/14_msa_b4, dalign_vs_node2.py)."""
+    table_not_redefined, bandpass_resolution.txt byte-identical; the .sal's Tp and ccmax bit-identical; log lines
+    identical. The .sal depends on MATLAB's thread count: the adaptive bandpass runs inside dynamo_execute_project,
+    which MATLAB runs with one thread per core of the job. The user's run had 64 (a whole 64-core node; found by
+    matching, benchmarks/16_box48/scan_threads.py), so the project is run with matlab_threads=64."""
     import scipy.io as sio
     root = tmp_path / "root"
     Pp = root / "abp_align_eo"
@@ -570,7 +570,7 @@ def test_abp_helical_ite4_user_files(tmp_path):
     dynio.write_txt(str(Pp / "results" / "bandpass_resolution.txt"), res[:3].reshape(1, -1))
     fv = str(Pp / "settings" / "virtual_project.mat")
     V.write_vpr_file(fv, V.modify(V.read_vpr_file(fv), "path", str(root)))
-    proj = DP.DynamoProject(str(Pp), str(root / "filamentsData_ctf"), str(Pp), echo=False)
+    proj = DP.DynamoProject(str(Pp), str(root / "filamentsData_ctf"), str(Pp), echo=False, matlab_threads=64)
     a2n = dynio.read_em(os.path.join(EUSER, f("average", 2)))
     proj.average_from_table = lambda ite, ref, table, fsc_sym=None: {"average": a2n}
     info = abp.adaptive_filtering(proj, 4)
@@ -581,8 +581,9 @@ def test_abp_helical_ite4_user_files(tmp_path):
         assert md5(str(Pp / nm)) == md5(os.path.join(EUSER, nm)), nm
     load = lambda p: sio.loadmat(p, squeeze_me=True, struct_as_record=False)["contents"]
     m, u = load(str(Pp / av / "alignmentRef2ToRef1_ite_0004.sal")), load(os.path.join(EUSER, av, "alignmentRef2ToRef1_ite_0004.sal"))
-    for a, b in ((m.Tp.shifts, u.Tp.shifts), (m.Tp.eulers, u.Tp.eulers), (m.ccmax, u.ccmax)):
-        assert np.max(np.abs(np.ravel(a).astype(float) - np.ravel(b).astype(float))) < 2e-12
+    for a, b in ((m.Tp.shifts, u.Tp.shifts), (m.Tp.eulers, u.Tp.eulers), (m.ccmax, u.ccmax), (m.ptable, u.ptable)):
+        a, b = np.ravel(a).astype(np.float64), np.ravel(b).astype(np.float64)
+        assert a.shape == b.shape and np.array_equal(a.view(np.int64), b.view(np.int64))
     mine = [l for l in open(str(Pp / "log.txt")).read().splitlines() if l.startswith("[bandpass")]
     with open(os.path.join(EUSER, "log.txt"), errors="replace") as fh:
         user = [l for l in fh.read().splitlines()[962542:] if l.startswith("[bandpass #4]")]

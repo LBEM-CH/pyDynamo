@@ -15,6 +15,8 @@ python run_dynamo_project.py --source <dynamo project folder> --data <data folde
 --iterations  stop after this global iteration (default: all iterations of the project)
 --engine      exact (default; Dynamo 1.1.514's own kernels, needs its engine binary and the CUDA 8 libraries) or fast
 --exact-sms   exact engine: reproduce the cuBLAS 8 reduction order of a GPU with this many SMs
+--matlab-threads  MATLAB thread count of the Dynamo run to reproduce (adaptive bandpass realignment; Dynamo uses
+              one per core of its job); default $PYDYN_MATLAB_THREADS, else one per physical core available here
 --report      opt-in JSON diagnostics ($PYDYN_REPORT); refused inside --out
 --progress-log  opt-in copy of the progress lines on stdout; refused inside --out
 --keep-temp   keep temp/ite_XXXX (Dynamo deletes it at the end of every assemble)
@@ -42,6 +44,7 @@ def main(argv=None):
     ap.add_argument("--engine", choices=("exact", "fast"), default=None,
                     help="GPU alignment engine (default: $PYDYN_ENGINE, else exact)")
     ap.add_argument("--exact-sms", type=int, default=None)
+    ap.add_argument("--matlab-threads", type=int, default=None)
     ap.add_argument("--report", default=None, metavar="PATH")
     ap.add_argument("--progress-log", default=None, metavar="PATH")
     a = ap.parse_args(argv)
@@ -53,7 +56,7 @@ def main(argv=None):
     gpus = [int(g) for g in a.gpus.split(",")] if a.gpus else None
     pr = DynamoProject(a.source, a.data, a.out, gpus=gpus, keep_temp=a.keep_temp,
                        table_initial=a.table_initial, engine=a.engine, exact_sms=a.exact_sms, report=a.report,
-                       progress_log=a.progress_log)
+                       progress_log=a.progress_log, matlab_threads=a.matlab_threads)
     rep = pr.run(iterations=a.iterations)
     print(json.dumps({"total_wall_s": rep.get("total_wall_s"),
                       "iterations": [{k: it[k] for k in ("ite", "wall_s", "setup_s", "compute_s", "assemble_s")}

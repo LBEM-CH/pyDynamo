@@ -15,12 +15,14 @@ Precision: the rotation kernels follow the mex operation by operation (float32, 
 the float32 angles, no FMA). Everything else is double with MATLAB R2019a's own numerics: sequential sums
 (pydyn.matlab_numerics), FFTW fftn / ifftn as MATLAB calls it (a conjugate-symmetric spectrum takes MATLAB's real
 inverse), MATLAB's complex multiply and conj, fdlibm sin/cos/atan2/acos/pow and MATLAB's atan2d builtin
-(pydyn.fdlibm), MATLAB's colon operator, and the sub-pixel fit in real arithmetic. Measured: dynamo_align is
-bit-identical (ptable, ccmax, every per-angle score, every angle list) to Dynamo 1.1.514 run headless with one
-thread on the same machine and the inputs stored in its .sal, for 4 + 4 iterations of two ABP projects, and on a
-synthetic pair (tests/test_matlab_exact.py). Dynamo's own .sal differs between machines by up to ~1e-12, so a .sal
-written by Dynamo elsewhere is matched to that level only. Only powers of two were verified as box sizes; a
-negative radicand in the sub-pixel fit is evaluated with Python complex powers (not verified).
+(pydyn.fdlibm), MATLAB's colon operator, and the sub-pixel fit in real arithmetic. MATLAB's sums depend on its
+thread count (pydyn.matlab_numerics.msum): Dynamo runs this alignment (adaptive bandpass) inside dynamo_execute_project,
+with one MATLAB thread per core of the job, so `threads` must be that count (the project runner's matlab_threads).
+Measured bit-identical to Dynamo 1.1.514 (ptable, ccmax, every per-angle score, every angle list): the stored .sal of
+the user's bin8 run and of the multi-tomogram run (64 threads, iterations 1-4), a box-48 project run here (16
+threads), headless dynamo_align with maxNumCompThreads(1) on both box-64 projects, and a synthetic pair
+(tests/test_matlab_exact.py). A negative radicand in the sub-pixel fit is evaluated with Python complex powers (not
+verified).
 
 Ported branches: area_search_modus 0 (localnc 1) and 2/3/4 (symmetric: dynamo_move; asymmetric: dynamo_rot_shift),
 use_CC 0/1, no 'band', no 'dim', no 'actions', no table (dynamo_table_blank), full Fourier sampling. Everything else
@@ -292,11 +294,12 @@ def ellipsoid(radii, n):
     return (((x / r[0]) ** 2 + (y / r[1]) ** 2 + (z / r[2]) ** 2) <= 1).astype(np.float64)
 
 
-def normalize_whole(v):
+def normalize_whole(v, threads=1):
     """dynamo_normalize_roi(v) without mask: dynamo_normalize_roi_one is called twice (dynamo_normalize_roi.m,
-    the no-mask branch), each time (v - mean) / std(v - mean) over all non-NaN voxels, with MATLAB's sums."""
+    the no-mask branch), each time (v - mean) / std(v - mean) over all non-NaN voxels, with MATLAB's sums for
+    `threads` computational threads."""
     ones = np.ones(np.shape(v))
-    return MN.normalize_roi(MN.normalize_roi(v, ones), ones)
+    return MN.normalize_roi(MN.normalize_roi(v, ones, threads), ones, threads)
 
 
 # =====================================================================================================================
@@ -397,16 +400,16 @@ def peak_subpixel(vol, vol0=None):
 # correlation (dynamo__align_motor.m local_correlation_general, :537-637)
 # =====================================================================================================================
 
-def local_correlation(small_template, small_mask, conjP, conjP2, want_matrix):
+def local_correlation(small_template, small_mask, conjP, conjP2, want_matrix, threads=1):
     """local_correlation_general with MATLAB's numerics (pydyn.matlab_numerics: sequential mean and sum, FFTW
     fftn / ifftn as MATLAB calls it, MATLAB's complex multiply); conjP / conjP2 = MN.conj of the spectra."""
     m = (small_mask == 1).astype(np.float64)
     t = small_template * m
     idx = m != 0
-    t[idx] = t[idx] - MN.mmean(t[idx])
+    t[idx] = t[idx] - MN.mmean(t[idx], threads)
     nmask = int(idx.sum())
     x = t[idx]
-    norm_t = math.sqrt(MN.msum(x * x))
+    norm_t = math.sqrt(MN.msum(x * x, threads))
     tp = t * m
     P1 = MN.fftn(tp)
     PM = MN.fftn(m)
@@ -439,7 +442,7 @@ def local_correlation(small_template, small_mask, conjP, conjP2, want_matrix):
 # the motor (dynamo__align_motor.m)
 # =====================================================================================================================
 
-def align_motor(scard, template, mask, conjP, conjP2, angles, ptable_input):
+def align_motor(scard, template, mask, conjP, conjP2, angles, ptable_input, threads=1):
     use_cc = int(scard["use_CC"])
     if use_cc not in (0, 1):
         raise NotImplementedError("use_CC %s in dynamo_align" % use_cc)
@@ -470,9 +473,9 @@ def align_motor(scard, template, mask, conjP, conjP2, angles, ptable_input):
         rt_raw, rmask = mex_shift_rot(template, (td, ti, na), (0, 0, 0), option=1, outscope=0.0, mask=mask)
         rt = MN.ifftn_real(MN.fftn(rt_raw))                        # dynamo_applyfiltermask(., ones)
         if modus == 0:
-            cc, pos, _ = local_correlation(rt, rmask, conjP, conjP2, False)
+            cc, pos, _ = local_correlation(rt, rmask, conjP, conjP2, False, threads)
         else:
-            _, _, ccm = local_correlation(rt, rmask, conjP, conjP2, True)
+            _, _, ccm = local_correlation(rt, rmask, conjP, conjP2, True, threads)
             masked = ccm * search_area + (-1.0 * (search_area == 0))
             pos, cc = peak_subpixel(masked, ccm)
         if cc > 1:
@@ -532,7 +535,7 @@ def blank_ptable():
     return t
 
 
-def dynamo_align(particle, template, vpr, settings_round, mask=None, verbose=True):
+def dynamo_align(particle, template, vpr, settings_round, mask=None, verbose=True, threads=1):
     """sal = dynamo_align(particle, template, 'settings_from', vpr, 'settings_round', r) (S/dynamo_align.m), the
     'pipeline' destination. particle/template: [z, y, x] double arrays. mask: the volume read from vpr.file_mask
     (the caller reads it, cwd-relative). Returns a dict with ptable (1x n columns), ccmax, ptable_refine, angles,
@@ -560,7 +563,7 @@ def dynamo_align(particle, template, vpr, settings_round, mask=None, verbose=Tru
     ptable[12] = 0                                                       # pfmask struct 'full' (:1258-1262)
     # filtermask_data = ones: particle_transformed = real(ifftn(fftn(p) .* fftshift(ones)))  (:1338-1340)
     pt = MN.ifftn_real(MN.fftn(particle))
-    pt = normalize_whole(pt)                                             # reproduce_pipeline :1796
+    pt = normalize_whole(pt, threads)                                    # reproduce_pipeline :1796
     P = MN.fftn(pt)
     P2 = MN.fftn(pt * pt)
     conjP, conjP2 = MN.conj(P), MN.conj(P2)
@@ -568,7 +571,7 @@ def dynamo_align(particle, template, vpr, settings_round, mask=None, verbose=Tru
              "area_search_modus": q["area_search_modus"], "feature_data_sidelength": n}
     levels, ccmax, cclist, alist = [], [], [], [angles]
     t_ops = time.time()
-    row, cc, ccl = align_motor(scard, template, mask, conjP, conjP2, angles, ptable)
+    row, cc, ccl = align_motor(scard, template, mask, conjP, conjP2, angles, ptable, threads)
     levels.append(row)
     ccmax.append(cc)
     cclist.append(ccl)
@@ -577,7 +580,7 @@ def dynamo_align(particle, template, vpr, settings_round, mask=None, verbose=Tru
         cr, cs, ir, is_ = multigrid(q["refine_factor"], cr, cs, ir, is_)
         ang = angleset(cr, cs, ir, is_, levels[-1][6:9], False, False)    # flips forced off (q.*_flip > 1 false)
         alist.append(ang)
-        row, cc, ccl = align_motor(scard, template, mask, conjP, conjP2, ang, levels[-1])
+        row, cc, ccl = align_motor(scard, template, mask, conjP, conjP2, ang, levels[-1], threads)
         levels.append(row)
         ccmax.append(cc)
         cclist.append(ccl)

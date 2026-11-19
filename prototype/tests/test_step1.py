@@ -273,8 +273,11 @@ def test_dynamo_execute_project_console_script_and_function(capsys, tmp_path, mo
     monkeypatch.setattr("pydyn.execute.execute_project", lambda name, **kw: ns.append((name, kw)) or True)
     assert cli.execute_main(["p", "--gpus", "1,2", "--engine", "fast", "--exact-sms", "64", "--iterations", "3",
                              "--report", "/x/r.json"]) == 0
+    assert cli.execute_main(["q", "--matlab-threads", "64"]) == 0
     assert ns == [("p", dict(gpus=[1, 2], keep_temp=False, iterations=3, engine="fast",
-                             exact_sms=64, report="/x/r.json"))]
+                             exact_sms=64, report="/x/r.json", matlab_threads=None)),
+                  ("q", dict(gpus=None, keep_temp=False, iterations=None, engine=None,
+                             exact_sms=None, report=None, matlab_threads=64))]
 
 
 # ------------------------------------------------------------------------------------------------ viewers in the dcp windows

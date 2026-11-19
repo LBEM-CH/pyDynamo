@@ -1,5 +1,5 @@
 {
-"_about": "MATLAB R2019a (Dynamo 1.1.514 runtime, headless, maxNumCompThreads(1)) on synthetic inputs; float64 as big-endian hex; *_sha = SHA-256 of the float64 little-endian bytes (C order). Made by benchmarks/14_msa_b4/fixture (probe9.m atan2d, probe10.m colon, probe12.m the rest).",
+"_about": "MATLAB R2019a (Dynamo 1.1.514 runtime, headless, maxNumCompThreads(1)) on synthetic inputs; float64 as big-endian hex; *_sha = SHA-256 of the float64 little-endian bytes (C order). Made by benchmarks/14_msa_b4/fixture (probe9.m atan2d, probe10.m colon, probe12.m the rest). fft_shapes: probe13.m (MATLAB size = reversed pydyn [z, y, x] shape). fft_shapes 80/96/128: benchmarks/15_fft_sizes/big/probe_big.m. msum_threads: benchmarks/15_fft_sizes/sums/sums.m (sum(x(1:n)) with maxNumCompThreads(T)).",
 "atan2d": {
 "y": [
 "bfe7c5817bf76fce",
@@ -2109,6 +2109,131 @@
 21,
 100,
 100
+]
+},
+"fft_shapes": {
+"18x18x18": {
+"fftn": "3c7950dc87dd466843eafa16a67564f837be0269aa2ae13e483a6f56de02d4ad",
+"ifftn_sym": "087003336709b891f7812c04dba1c3095ba08198c19f699ab2eacb1892062238",
+"ifftn": "032ff68e1c7251030022e700601bce8944f2083ad77053ba378d24fc0b11623a",
+"product_sym": "1facff4490b7385f6f538c06b42847d93bbf2bfb8e32af402fb440164dc9fc56"
+},
+"20x20x20": {
+"fftn": "fe18cb8bdce37496dd92f90a687510dea09829693e1b3de545cb2fd3b2fdae4a",
+"ifftn_sym": "4a275bcb40aec9df507140686108823cc36c87e0f3becacc41b067f29b996acf",
+"ifftn": "77baa7b9fc55e43ea5834501d50339e95e71319a6fc6cbdd19d81044ea9ef556",
+"product_sym": "82697ae252e75de05b09612b4afe1c8c36d3b40e7d06b9d8add2e3dfcf2ea269"
+},
+"21x21x21": {
+"fftn": "2b1bfcfc404eb2efe318fdd7eefe0c375b337bc998a0557958ae4364d216c6bb",
+"ifftn_sym": "00ff3f7fc6fc653f81b1a137ed1305ecee09160497755b0aea1bc35feb24e5a7",
+"ifftn": "4735d1d48dbc0897eaf54469a9ba959045fc0afd72da69ef2a0d034b8009cbd3",
+"product_sym": "786c8761f57b95fc873c3ebba6e5449bbfd3f953e896aea11d4003c4b0e6685f"
+},
+"30x30x30": {
+"fftn": "8065d69133c7df6e32233b59497d78aa9d975944a8f042b1ae0f0c61769ee3f9",
+"ifftn_sym": "2f4f23ec8e1100b11465e1f3731c68856edf80d5f65f164343281be8be0e8e61",
+"ifftn": "ea57d028d7b3fd7030a3b9bdc9a93495c0155c08c69dc6f46326b9329e3bb415",
+"product_sym": "60ac4292a269869a01e765b84290e1f61e32076c3b833d79d8d87ec5023bb713"
+},
+"21x18x20": {
+"fftn": "fa37721578d5c64d31437536c428d3eefdfc3d58bfb3d9d864ede65663c10f1d",
+"ifftn_sym": "e724610ec62df6f49036b5474d2d86e1ddfa08b8b68f157623ea2497f5b63e1d",
+"ifftn": "13a003971b41b867137632ffd4987d928e5560d8e8c4b2b4eba33540d4080f2d",
+"product_sym": "c499652a204b38516d4768c93128dea3842040fc2be046b62a8b8a67adaca076"
+},
+"80x80x80": {
+"fftn": "24c7f5eaa58a6727b55bd1e789c85ec24df1aee44a8a9462c521613c88707c6b",
+"ifftn_sym": "da66cd8858bf74695b4a9b41a1f9e615fb9f9be7fce4c7d001261fe9d03e2b78",
+"ifftn": "b7fe9ece02fb898d923f6ca5a48503a5ff2444f83b51a6f6d52dca67172ed85a",
+"product_sym": "3f7bc490895b896bf4ecd35eabb88848f4c9711a9c9759ae8c01b321a1cfa1fc"
+},
+"96x96x96": {
+"fftn": "29a5ec106a299133c1513ac0cf2cc00e09fc0a4c62297b245ce23a15ef7b62e9",
+"ifftn_sym": "ec04f96c2a5f8438222e6babcc4492a10d03dc8cf16a4015b07338d49c2f4802",
+"ifftn": "81e19f9ac2523aad15e37eb25939027d33e562dcc833c8dcd91f5ef8833cdfe8",
+"product_sym": "b1d1eed8d1124b8a8d0f36150665af9477ec46d063c0951779a379324df0ecf3"
+},
+"128x128x128": {
+"fftn": "52ee5a49e583888aa48f2206c54ab1a92355998be2ad1247fec56648beea81ea",
+"ifftn_sym": "3a7f5714474c00bdf2ebf222c58b4ef3c277f7a1ed68281901cac7604860af6e",
+"ifftn": "8c0e88d9c2e39a8eed652d65da9d1954b45cdf80ccc9c0c8700b2a4e99f9b30c",
+"product_sym": "b7e563ba3effbee6f18e474d5d2d73240008e03416ba51c19fef855e5ab939c4"
+}
+},
+"msum_threads": {
+"n": [
+88999,
+89000,
+100000,
+262144,
+1000000,
+3000000
+],
+"threads": [
+1,
+2,
+3,
+4,
+7,
+16,
+64
+],
+"sum": [
+[
+"40c6995a444e3078",
+"40c6995a444e3078",
+"40c6995a444e3078",
+"40c6995a444e3078",
+"40c6995a444e3078",
+"40c6995a444e3078",
+"40c6995a444e3078"
+],
+[
+"40c6992be951e8ba",
+"40c6992be951e8be",
+"40c6992be951e8b9",
+"40c6992be951e8bf",
+"40c6992be951e8bd",
+"40c6992be951e8bd",
+"40c6992be951e8bc"
+],
+[
+"40c964447cbaab9d",
+"40c964447cbaab9d",
+"40c964447cbaab9e",
+"40c964447cbaab9a",
+"40c964447cbaab9d",
+"40c964447cbaab9a",
+"40c964447cbaab9c"
+],
+[
+"40e0a3d93db12079",
+"40e0a3d93db12074",
+"40e0a3d93db12072",
+"40e0a3d93db12073",
+"40e0a3d93db12073",
+"40e0a3d93db12074",
+"40e0a3d93db12073"
+],
+[
+"40ffbd127c56e5f2",
+"40ffbd127c56e5f6",
+"40ffbd127c56e5f6",
+"40ffbd127c56e5f3",
+"40ffbd127c56e5f3",
+"40ffbd127c56e5f1",
+"40ffbd127c56e5f1"
+],
+[
+"4117cdc8af132d9b",
+"4117cdc8af132d8e",
+"4117cdc8af132d90",
+"4117cdc8af132d90",
+"4117cdc8af132d8f",
+"4117cdc8af132d92",
+"4117cdc8af132d90"
+]
 ]
 }
 }

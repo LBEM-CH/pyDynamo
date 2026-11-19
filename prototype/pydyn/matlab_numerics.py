@@ -1,16 +1,24 @@
 """MATLAB numerics as Dynamo 1.1.514's executables compute them, bit for bit.
 
-Dynamo compiles its non-graphical executables (dynamo_execute_project, which runs a dcp project) with
-`-R -singleCompThread` (matlab/src/dynamo_compile.m:377-387), so MATLAB runs single-threaded there. Measured in the
-Dynamo 1.1.514 MATLAB runtime (R2019a):
-* sum(x) of a double vector is then strictly sequential, left to right, starting from 0 (with more threads and
-  n >= 89,000 MATLAB splits x into T chunks of floor(n/T), which changes the last bits; the project path never does);
+MATLAB's thread count matters for sums. Dynamo's kernel executables (dynamo_iteration_setup / _compute / _assemble /
+_check: the set-up, the averaging) are compiled with `-R -singleCompThread` (matlab/src/dynamo_compile.m:377-387 for
+targets with graphics = 0, matlab/src/+dpkdev/+compile/convention.m read_group3), so MATLAB runs single-threaded
+there. dynamo_execute_project itself (graphics = 1, convention.m) is not: the post-processing that runs inside it
+(the adaptive bandpass and its ref2 -> ref1 realignment, dynamo_align) uses MATLAB's default thread count, one per
+available core (measured: a run in a 16-core job is reproduced by maxNumCompThreads(16) and by no other count).
+Measured in the Dynamo 1.1.514 MATLAB runtime (R2019a):
+* sum(x) of a double vector with T threads: n < 89,000 or T = 1 -> strictly sequential, left to right from 0;
+  otherwise T chunks of floor(n/T) summed sequentially, the chunk sums added in order, then the n mod T last
+  elements added one by one (msum(x, threads=T));
 * mean(x) = sum(x) / n; std(x) = sqrt(sum(abs(x - mean(x)).^2) / (n - 1)) with those sums;
-* fftn / ifftn are FFTW (pydyn.masks: r2c + Hermitian completion for a real input; for ifftn MATLAB tests the
-  input for exact conjugate symmetry and then computes ifft(ifft(ifft(V,[],1),[],2),[],3) with a complex-to-real
-  last step, otherwise the complex 3-D backward transform; / N); the system FFTW 3.3.8 gives the same bits as
-  MATLAB's own FFTW 3.3.3, so no MATLAB library is needed. Verified on 64^3 boxes; MATLAB's FFTs of
-  non-power-of-two boxes (48, 50, 45 tested) differ from these FFTW plans.
+* fftn / ifftn are MATLAB's own FFTW calls, reproduced in pydyn.masks._FFTW (read from MATLAB with an FFTW call
+  logger): 1-D transforms one dimension at a time, 4 lines per plan execution plus single left-over lines, ifft
+  divided by n after every dimension; a real fftn's redundant half is the conjugate mirror of the computed one;
+  ifftn of an exactly conjugate-symmetric array takes a complex-to-real last step along z. Measured bit-identical
+  for boxes 16 to 320 incl. odd, non-power-of-two and non-cubic sizes (MATLAB plans FFTW single-threaded at any
+  thread count); the system FFTW 3.3.8 gives the same bits as MATLAB's own FFTW 3.3.3, so no MATLAB library is
+  needed.
+* MATLAB's sum rule (n >= 89,000 chunked by threads) is verified for n up to 33,000,000 and T = 1, 2, 3, 4, 7, 16, 64.
 NumPy's sum / mean / std use pairwise orders and NumPy's FFT is pocketfft; both differ in the last bits, which is
 enough to change float32 voxels of Dynamo's averages and the noise-level shells of an FSC. MATLAB's linear index
 order of an [x, y, z] array is the C order of pyDynamo's [z, y, x] arrays, so flat order = MATLAB order.
@@ -18,37 +26,83 @@ order of an [x, y, z] array is the C order of pyDynamo's [z, y, x] arrays, so fl
 import numpy as np
 
 
-def msum(x):
-    """MATLAB sum of a vector (single computational thread): sequential, left to right."""
+THREADED_SUM_MIN = 89000
+
+
+def matlab_threads():
+    """MATLAB's default computational thread count here, as dynamo_execute_project would get it: one per physical
+    core the process may run on (os.sched_getaffinity; logical CPUs that are SMT siblings of one core count once).
+    $PYDYN_MATLAB_THREADS overrides it (e.g. 64 to reproduce a Dynamo run that had a whole 64-core node)."""
+    import os
+    env = os.environ.get("PYDYN_MATLAB_THREADS", "").strip()
+    if env:
+        t = int(env)
+        if t < 1:
+            raise ValueError("PYDYN_MATLAB_THREADS must be >= 1, got %r" % env)
+        return t
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+    cores = set()
+    for c in cpus:
+        base = "/sys/devices/system/cpu/cpu%d/topology/" % c
+        try:
+            with open(base + "physical_package_id") as f1, open(base + "core_id") as f2:
+                cores.add((f1.read().strip(), f2.read().strip()))
+        except OSError:
+            cores.add(("cpu", str(c)))
+    return max(1, len(cores))
+
+
+def msum(x, threads=1):
+    """MATLAB sum of a vector with `threads` computational threads (see the module doc)."""
     x = np.asarray(x, dtype=np.float64).ravel()
-    return float(np.cumsum(x)[-1]) if x.size else 0.0
+    n = x.size
+    if n == 0:
+        return 0.0
+    T = int(threads)
+    if T <= 1 or n < THREADED_SUM_MIN:
+        return float(np.cumsum(x)[-1])
+    q = n // T
+    if q:
+        parts = np.cumsum(x[:T * q].reshape(T, q), axis=1)[:, -1]
+        r = parts[0]
+        for c in range(1, T):
+            r = r + parts[c]
+    else:
+        r = 0.0
+    for k in range(T * q, n):
+        r = r + x[k]
+    return float(r)
 
 
-def mmean(x):
+def mmean(x, threads=1):
     x = np.asarray(x, dtype=np.float64).ravel()
-    return msum(x) / x.size
+    return msum(x, threads) / x.size
 
 
-def mstd(x):
+def mstd(x, threads=1):
     """MATLAB std(x) (normalised by n - 1): sqrt(sum(abs(x - mean(x)).^2) / (n - 1)); 0 for a scalar."""
     x = np.asarray(x, dtype=np.float64).ravel()
     n = x.size
     if n < 2:
         return 0.0
-    d = x - mmean(x)
-    return float(np.sqrt(msum(np.abs(d) ** 2) / (n - 1)))
+    d = x - mmean(x, threads)
+    return float(np.sqrt(msum(np.abs(d) ** 2, threads) / (n - 1)))
 
 
-def normalize_roi(v, mask):
+def normalize_roi(v, mask, threads=1):
     """dynamo_normalize_roi_one (dynamo_normalize_roi.m): iroi = v(setdiff(find(mask), find(isnan(v)))) in index
-    order; miroi = mean(iroi); stdiroi = std(iroi - miroi); (v - mean(iroi)) ./ stdiroi. In double."""
+    order; miroi = mean(iroi); stdiroi = std(iroi - miroi); (v - mean(iroi)) ./ stdiroi. In double, with MATLAB's
+    sums for `threads` computational threads."""
     v = np.asarray(v, dtype=np.float64)
     sel = (np.asarray(mask).ravel() != 0) & ~np.isnan(v.ravel())
     iroi = v.ravel()[sel]
     if iroi.size == 0:
         raise ValueError("normalize_roi: no valid points found in this particle")
-    mu = msum(iroi) / iroi.size
-    sd = mstd(iroi - mu)
+    mu = msum(iroi, threads) / iroi.size
+    sd = mstd(iroi - mu, threads)
     return (v - mu) / sd
 
 
@@ -72,17 +126,26 @@ def fftn(v):
     """MATLAB fftn of a real 3-D array (FFTW when available, else numpy, which is not bit-identical)."""
     b = _fftw()
     v = np.asarray(v, dtype=np.float64)
-    return b.rfftn_full(v) if b is not None else np.fft.fftn(v)
+    return b.fftn_real(v) if b is not None else np.fft.fftn(v)
 
 
 def ifftn_real(V):
-    """real(ifftn(V)) of a 3-D complex array as MATLAB computes it (pydyn.masks._FFTW.ifftn_real: an exactly
-    conjugate-symmetric V takes MATLAB's real path, x and y complex then z complex-to-real; any other V the
-    complex 3-D backward transform; / N)."""
+    """real(ifftn(V)) of a 3-D complex array as MATLAB computes it (pydyn.masks._FFTW.ifftn_real): an exactly
+    conjugate-symmetric V takes MATLAB's real path (ifft along x / nx, along y / ny, complex-to-real along z / nz);
+    any other V MATLAB's complex ifftn (ifft along x, y, z, each part / n), real part."""
     b = _fftw()
     if b is None:
         return np.real(np.fft.ifftn(V))
     return b.ifftn_real(V)
+
+
+def ifftn(V):
+    """MATLAB ifftn of a 3-D complex array that is not conjugate-symmetric (complex result; FFTW when available,
+    else numpy)."""
+    b = _fftw()
+    if b is None:
+        return np.fft.ifftn(V)
+    return b.ifftn(V)
 
 
 def exact_fft():
