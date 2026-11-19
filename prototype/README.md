@@ -4,8 +4,10 @@
 projects, the GPU alignment and the averaging) in Python, without MATLAB. The tables, averages and cards it writes are
 bit-identical to Dynamo's in these conditions: the exact engine runs on the same GPU model (or with `--exact-sms`),
 and an FFTW 3 library is available. The `.exe` is byte-identical, and `log.txt` follows Dynamo's line by line.
-Exception: with adaptive_bandpass = 1, the realignment of reference 2 (`pydyn/dalign.py`: NumPy/SciPy FFTs and
-sums) matches Dynamo to round-off (about 1e-14), not bit for bit.
+With adaptive_bandpass = 1, the realignment of reference 2 (`pydyn/dalign.py`) is bit-identical to Dynamo run on
+the same machine; Dynamo's own result for this step differs between machines by up to about 1e-12 (measured), so a
+project computed by Dynamo elsewhere can differ there in the last digits. Box sizes that are not a power of two are
+not verified: MATLAB's FFTs of 45^3, 48^3 and 50^3 arrays differ from pyDynamo's FFTW calls.
 
 Names: **pyDynamo** is the project (MIT licence, see `LICENSE` and `NOTICE`). **pydyn** is the Python package
 (`prototype/pydyn`). **pydynamo** is the environment (`.envs/pydynamo`) and also the console command. Paths below are

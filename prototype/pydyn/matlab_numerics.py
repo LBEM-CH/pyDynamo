@@ -6,8 +6,11 @@ Dynamo 1.1.514 MATLAB runtime (R2019a):
 * sum(x) of a double vector is then strictly sequential, left to right, starting from 0 (with more threads and
   n >= 89,000 MATLAB splits x into T chunks of floor(n/T), which changes the last bits; the project path never does);
 * mean(x) = sum(x) / n; std(x) = sqrt(sum(abs(x - mean(x)).^2) / (n - 1)) with those sums;
-* fftn / ifftn are FFTW (pydyn.masks: r2c + Hermitian completion for a real input; complex backward / N); the
-  system FFTW 3.3.8 gives the same bits as MATLAB's own FFTW 3.3.3, so no MATLAB library is needed.
+* fftn / ifftn are FFTW (pydyn.masks: r2c + Hermitian completion for a real input; for ifftn MATLAB tests the
+  input for exact conjugate symmetry and then computes ifft(ifft(ifft(V,[],1),[],2),[],3) with a complex-to-real
+  last step, otherwise the complex 3-D backward transform; / N); the system FFTW 3.3.8 gives the same bits as
+  MATLAB's own FFTW 3.3.3, so no MATLAB library is needed. Verified on 64^3 boxes; MATLAB's FFTs of
+  non-power-of-two boxes (48, 50, 45 tested) differ from these FFTW plans.
 NumPy's sum / mean / std use pairwise orders and NumPy's FFT is pocketfft; both differ in the last bits, which is
 enough to change float32 voxels of Dynamo's averages and the noise-level shells of an FSC. MATLAB's linear index
 order of an [x, y, z] array is the C order of pyDynamo's [z, y, x] arrays, so flat order = MATLAB order.
@@ -73,12 +76,13 @@ def fftn(v):
 
 
 def ifftn_real(V):
-    """real(ifftn(V)) of a 3-D complex array: FFTW complex backward, real part, / N."""
+    """real(ifftn(V)) of a 3-D complex array as MATLAB computes it (pydyn.masks._FFTW.ifftn_real: an exactly
+    conjugate-symmetric V takes MATLAB's real path, x and y complex then z complex-to-real; any other V the
+    complex 3-D backward transform; / N)."""
     b = _fftw()
     if b is None:
         return np.real(np.fft.ifftn(V))
-    from .masks import _FFTW
-    return np.real(b.cfftn(V, _FFTW.BACKWARD)) / V.size
+    return b.ifftn_real(V)
 
 
 def exact_fft():
@@ -113,9 +117,35 @@ def cdiv_real(V, F):
     return out
 
 
+def conj(V):
+    """MATLAB conj of a complex array: (re, 0 - im); a zero imaginary part becomes +0 (measured: with NumPy's
+    -im, A .* conj(B) differs from MATLAB in the sign of 3 zeros of a 64^3 product)."""
+    out = np.empty(np.shape(V), dtype=np.complex128)
+    out.real = np.real(V)
+    out.imag = 0.0 - np.imag(V)
+    return out
+
+
+def cmul(A, B):
+    """MATLAB A .* B of complex arrays: (ar*br - ai*bi, ar*bi + ai*br), every product rounded on its own.
+    NumPy's complex multiply may use fused multiply-adds (measured: 57,690 real and 80,329 imaginary parts of a
+    64^3 product differ from MATLAB)."""
+    ar, ai, br, bi = np.real(A), np.imag(A), np.real(B), np.imag(B)
+    out = np.empty(np.broadcast(A, B).shape, dtype=np.complex128)
+    out.real = ar * br - ai * bi
+    out.imag = ar * bi + ai * br
+    return out
+
+
 def bandpass_filter(vol, mask_shifted):
-    """real(ifftn(fftn(vol) .* mask_shifted)) (dynamo_bandpass with a precomputed, already fftshifted shell)."""
-    return ifftn_real(fftn(vol) * mask_shifted)
+    """real(ifftn(fftn(vol) .* mask_shifted)) (dynamo_bandpass with a precomputed, already fftshifted shell; MATLAB
+    complex .* real multiplies each part, without NumPy's promotion of the mask to complex)."""
+    V = fftn(vol)
+    m = np.asarray(mask_shifted, dtype=np.float64)
+    out = np.empty(V.shape, dtype=np.complex128)
+    out.real = V.real * m
+    out.imag = V.imag * m
+    return ifftn_real(out)
 
 
 # ------------------------------------------------------------------------------------------------------------ FSC

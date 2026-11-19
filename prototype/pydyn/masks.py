@@ -23,8 +23,10 @@ write. Measured against headless Dynamo dumps (benchmarks/06_abp_align_eo/implB,
 * exp: matlab_exp below (fdlibm e_exp.c, vectorised) is bit-identical to MATLAB on all 262,144 blob arguments;
   numpy / glibc exp differ there by +-1 ulp in 24,518 values;
 * fftn(real 3-D) = FFTW r2c 3-D (FFTW_ESTIMATE) + Hermitian completion: bit-identical to MATLAB;
-* ifftn(F) for the product spectrum = FFTW complex backward 3-D (FFTW_ESTIMATE), real part, divided by N:
-  bit-identical to MATLAB;
+* ifftn(F) for the product spectrum: MATLAB tests F for exact conjugate symmetry; a symmetric F (as here) is
+  inverted as ifft along x and y (complex) and a complex-to-real ifft along z, any other F by the complex backward
+  3-D transform, real part, / N (_FFTW.ifftn_real). Bit-identical to MATLAB (for the mask-editor spectrum both
+  orders give the same bits; for a particle spectrum of dynamo_align only MATLAB's order does);
 * with both, a real dcp mask-editor mask is reproduced byte for byte with the system FFTW 3.3.8 (libfftw3.so.3),
   exactly as with MATLAB's own FFTW 3.3.3; the averaging (pydyn.matlab_numerics) is bit-identical with it too. With numpy / scipy.fft only the voxels with
   |v| > 1e-6 are bit-identical (max |diff| below 1e-15 before the float32 write).
@@ -152,6 +154,81 @@ class _FFTW:
         self.lib.fftw_destroy_plan(p)
         return o.copy()
 
+    def _guru(self):
+        if not hasattr(self, "_iodim"):
+            class IODim(ctypes.Structure):
+                _fields_ = [("n", ctypes.c_int), ("is_", ctypes.c_int), ("os_", ctypes.c_int)]
+            vp, ci, cu, pd = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.POINTER(IODim)
+            self.lib.fftw_plan_guru_dft.restype = vp
+            self.lib.fftw_plan_guru_dft.argtypes = [ci, pd, ci, pd, vp, vp, ci, cu]
+            self.lib.fftw_plan_guru_dft_c2r.restype = vp
+            self.lib.fftw_plan_guru_dft_c2r.argtypes = [ci, pd, ci, pd, vp, vp, cu]
+            self._iodim = IODim
+        return self._iodim
+
+    def cfft_axis(self, x, axis, sign):
+        """1-D complex transforms along one axis of a 3-D array (unnormalised), all other lines at once."""
+        IODim = self._guru()
+        x = np.ascontiguousarray(x, dtype=np.complex128)
+        st = [x.strides[k] // 16 for k in range(3)]
+        a = self._aligned(x.shape, np.complex128)
+        o = self._aligned(x.shape, np.complex128)
+        d = (IODim * 1)(IODim(x.shape[axis], st[axis], st[axis]))
+        h = (IODim * 2)(*[IODim(x.shape[k], st[k], st[k]) for k in range(3) if k != axis])
+        p = self.lib.fftw_plan_guru_dft(1, d, 2, h, a.ctypes.data, o.ctypes.data, sign, self.ESTIMATE)
+        if not p:
+            raise RuntimeError("FFTW could not plan c2c along axis %d of %s" % (axis, x.shape))
+        a[...] = x
+        self.lib.fftw_execute(p)
+        self.lib.fftw_destroy_plan(p)
+        return o.copy()
+
+    def c2r_axis0(self, x, n0):
+        """1-D complex-to-real backward transforms along axis 0 (unnormalised): x holds planes 0..n0//2 of a
+        spectrum that is conjugate-symmetric along axis 0; returns the real [n0, n1, n2] result."""
+        IODim = self._guru()
+        x = np.ascontiguousarray(x, dtype=np.complex128)
+        h0, n1, n2 = x.shape
+        if h0 != n0 // 2 + 1:
+            raise ValueError("c2r_axis0: %d planes given for length %d" % (h0, n0))
+        a = self._aligned(x.shape, np.complex128)
+        o = self._aligned((n0, n1, n2), np.float64)
+        d = (IODim * 1)(IODim(n0, n1 * n2, n1 * n2))
+        h = (IODim * 2)(IODim(n1, n2, n2), IODim(n2, 1, 1))
+        p = self.lib.fftw_plan_guru_dft_c2r(1, d, 2, h, a.ctypes.data, o.ctypes.data, self.ESTIMATE)
+        if not p:
+            raise RuntimeError("FFTW could not plan c2r along axis 0 of %s" % ((n0, n1, n2),))
+        a[...] = x
+        self.lib.fftw_execute(p)
+        self.lib.fftw_destroy_plan(p)
+        return o.copy()
+
+    def ifftn_real(self, V):
+        """real(ifftn(V)) of a 3-D complex array as MATLAB R2019a computes it. MATLAB first tests whether V is
+        exactly conjugate-symmetric (V(k) == conj(V(-k)) for every k). If it is, the result is real and is computed
+        as ifft along MATLAB dim 1 (x) and dim 2 (y), complex, then a complex-to-real ifft along dim 3 (z), i.e.
+        ifft(ifft(ifft(V,[],1),[],2),[],3); otherwise it is the complex 3-D backward transform. Both / N.
+        Measured on Dynamo's own 64^3 inputs (benchmarks/14_msa_b4/probe): bit-identical; the 3-D complex
+        transform differs there in 164,182 of 262,144 values. Box sizes that are not powers of two are not
+        verified (MATLAB's FFTs of a 48^3, 50^3 or 45^3 array differ from these FFTW plans)."""
+        V = np.asarray(V)
+        if conj_symmetric(V):
+            n0 = V.shape[0]
+            A = self.cfft_axis(V[: n0 // 2 + 1], 2, self.BACKWARD)
+            A = self.cfft_axis(A, 1, self.BACKWARD)
+            return self.c2r_axis0(A, n0) / V.size
+        return np.real(self.cfftn(V, self.BACKWARD)) / V.size
+
+
+def conj_symmetric(V):
+    """True when V(k) == conj(V(-k mod n)) holds exactly for every element (MATLAB's ifftn symmetry test;
+    NaN never compares equal)."""
+    if not np.iscomplexobj(V):
+        V = V.astype(np.complex128)
+    idx = [(-np.arange(s)) % s for s in V.shape]
+    M = V[np.ix_(*idx)]
+    return bool(np.array_equal(V.real, M.real) and np.array_equal(V.imag, -M.imag))
+
 
 _BACKEND = {}
 
@@ -189,8 +266,8 @@ def _filter_local(a, filt):
     fft_backend()
     b = _BACKEND["b"]
     if b is not None and a.ndim == 3:
-        P = b.rfftn_full(a) * b.rfftn_full(fr)
-        return np.real(b.cfftn(P, _FFTW.BACKWARD)) / a.size
+        from .matlab_numerics import cmul
+        return b.ifftn_real(cmul(b.rfftn_full(a), b.rfftn_full(fr)))
     warnings.warn("pydyn.masks: no FFTW library found; dynamo_mollify uses scipy.fft. Voxels above 1e-6 are "
                   "bit-identical to Dynamo, the round-off floor below 1e-13 is not (set PYDYN_FFTW_LIB).")
     import scipy.fft as sf

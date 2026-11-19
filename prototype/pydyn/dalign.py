@@ -12,11 +12,15 @@ Arrays are numpy [z, y, x] (Dynamo x = MATLAB dim 1 = numpy last axis). Column-m
 is C order of a [z, y, x] array.
 
 Precision: the rotation kernels follow the mex operation by operation (float32, double matrix from glibc cos/sin of
-the float32 angles, no FMA) and are exact for the inputs tested (09b 9.2, 08b 4.4). Everything else is double, as in
-MATLAB, and MATLAB's sin/cos/atan2/acos are reproduced bit for bit (pydyn.fdlibm), but FFTs (pocketfft vs FFTW)
-and sums are not bit-identical here yet: the scores and
-sub-pixel shifts agree with Dynamo to roundoff, and the chosen orientation is the same unless two orientations tie
-within roundoff. See tests/test_eo_abp.py for the verified tolerances.
+the float32 angles, no FMA). Everything else is double with MATLAB R2019a's own numerics: sequential sums
+(pydyn.matlab_numerics), FFTW fftn / ifftn as MATLAB calls it (a conjugate-symmetric spectrum takes MATLAB's real
+inverse), MATLAB's complex multiply and conj, fdlibm sin/cos/atan2/acos/pow and MATLAB's atan2d builtin
+(pydyn.fdlibm), MATLAB's colon operator, and the sub-pixel fit in real arithmetic. Measured: dynamo_align is
+bit-identical (ptable, ccmax, every per-angle score, every angle list) to Dynamo 1.1.514 run headless with one
+thread on the same machine and the inputs stored in its .sal, for 4 + 4 iterations of two ABP projects, and on a
+synthetic pair (tests/test_matlab_exact.py). Dynamo's own .sal differs between machines by up to ~1e-12, so a .sal
+written by Dynamo elsewhere is matched to that level only. Only powers of two were verified as box sizes; a
+negative radicand in the sub-pixel fit is evaluated with Python complex powers (not verified).
 
 Ported branches: area_search_modus 0 (localnc 1) and 2/3/4 (symmetric: dynamo_move; asymmetric: dynamo_rot_shift),
 use_CC 0/1, no 'band', no 'dim', no 'actions', no table (dynamo_table_blank), full Fourier sampling. Everything else
@@ -29,22 +33,7 @@ import numpy as np
 from . import fdlibm as _F
 from . import matlab_numerics as MN
 
-try:
-    import scipy.fft as _fft
-    _W = {"workers": -1}
-except Exception:                                                   # pragma: no cover
-    _fft = np.fft
-    _W = {}
-
 F32 = np.float32
-
-
-def _fftn(x):
-    return _fft.fftn(x, **_W)
-
-
-def _ifftn(x):
-    return _fft.ifftn(x, **_W)
 _D2R = 0.017453292519943295
 
 
@@ -56,7 +45,9 @@ def matlab_colon(a, d, b):
     """a:d:b of MATLAB (double), the algorithm MathWorks documents for the colon operator (colonop, C. Moler,
     "The colon operator", 2019): n = round((b-a)/d), reduced by one if a+n*d overshoots b by more than
     tol = 2*eps*max(|a|,|b|); the right end c = a+n*d is snapped to b within tol; elements a+k*d from the left and
-    c-k*d from the right, (a+c)/2 in the middle for even n."""
+    c-k*d from the right. For even n the middle element of MATLAB R2019a's builtin is a + (c-a)/2 when a and c have
+    the same sign and (a+c)/2 otherwise (measured: 0 of 20,000 random ranges differ; Moler's (a+c)/2 alone differs
+    in 72)."""
     eps = 2.220446049250313e-16
     if d == 0 or (d > 0 and a > b) or (d < 0 and a < b) or any(map(math.isnan, (a, d, b))):
         return np.zeros(0)
@@ -73,7 +64,7 @@ def matlab_colon(a, d, b):
     v[k] = a + k * d
     v[n - k] = c - k * d
     if n % 2 == 0:
-        v[n // 2] = (a + c) / 2
+        v[n // 2] = a + (c - a) / 2 if a * c > 0 else (a + c) / 2
     return v
 
 
@@ -139,7 +130,7 @@ def _best_narot(eu1, eu2):
     beta = _T.cos(td1) * _T.sin(na1) + _T.sin(td1) * _T.cos(ti1) * _T.cos(na1)
     A = alpha * _T.cos(td2) + beta * _T.sin(td2) * _T.cos(ti2)
     B = beta * _T.cos(td2) - alpha * _T.sin(td2) * _T.cos(ti2)
-    return (180 / math.pi) * _T.atan2(B, A)                      # atan2d = 180/pi * atan2 (fewer differences [RUN])
+    return _F.atan2d(B, A)                                       # MATLAB's atan2d builtin (pydyn.fdlibm)
 
 
 def angleincrement2list(aperture, interval, inplane_range=0, inplane_sample=1, old_angles=(0, 0, 0)):
@@ -303,52 +294,71 @@ def ellipsoid(radii, n):
 
 def normalize_whole(v):
     """dynamo_normalize_roi(v) without mask: dynamo_normalize_roi_one is called twice (dynamo_normalize_roi.m,
-    the no-mask branch), each time (v - mean) / std(v - mean) over all non-NaN voxels."""
-    for _ in range(2):
-        roi = v[~np.isnan(v)]
-        mu = roi.mean()
-        sd = np.std(roi - mu, ddof=1)
-        v = (v - mu) / sd
-    return v
+    the no-mask branch), each time (v - mean) / std(v - mean) over all non-NaN voxels, with MATLAB's sums."""
+    ones = np.ones(np.shape(v))
+    return MN.normalize_roi(MN.normalize_roi(v, ones), ones)
 
 
 # =====================================================================================================================
 # peak (dynamo_peak_subpixel.m)
 # =====================================================================================================================
 
+def _rdiv(a, b):
+    """MATLAB real scalar a / b (IEEE: x/0 = +-Inf, 0/0 = NaN)."""
+    if b != 0:
+        return a / b
+    if a == 0 or math.isnan(a):
+        return math.nan
+    return math.copysign(math.inf, a) * math.copysign(1.0, b)
+
+
+def _cdiv(a, b):
+    """MATLAB complex / real scalar: each part divided (b real)."""
+    return complex(_rdiv(a.real, b), _rdiv(a.imag, b))
+
+
 def _subpixel_direction(y1, y2, y3):
-    """dynamo_peak_subpixel_direction (double, complex powers as in MATLAB)."""
+    """dynamo_peak_subpixel_direction (S/dynamo_peak_subpixel.m) with MATLAB's scalar arithmetic: x^2 = x*x, x^(1/2)
+    and x^(3/2) = fdlibm pow (pow(x, 0.5) is sqrt(x)), left to right as written. Candidates 1-2 use only
+    z1^(1/2), candidates 3-4 only z2^(1/2) and z2^(3/2); a pair is complex in MATLAB only when its own radicand is
+    negative, and its values then have a nonzero imaginary part and are set to -Inf (ind_imag). That complex pair is
+    evaluated here with Python complex powers, only to test the imaginary part (not verified bit for bit)."""
     if y1 == y3:
         return y2, 0.0
     if abs(y2 - y3) >= 2 or abs(y2 - y1) >= 2:
         return y2, 0.0
-    y1, y2, y3 = complex(y1), complex(y2), complex(y3)
-    z1 = (- y1 ** 2 / 4 + (y1 * y3) / 2 + y2 ** 2 - 2 * y2 * y3 + (3 * y3 ** 2) / 4)
-    z2 = ((3 * y1 ** 2) / 4 - 2 * y1 * y2 + (y1 * y3) / 2 + y2 ** 2 - y3 ** 2 / 4)
-    s1, s2 = z1 ** 0.5, z2 ** 0.5
+    z1 = (- (y1 * y1) / 4 + (y1 * y3) / 2 + y2 * y2 - 2 * y2 * y3 + (3 * (y3 * y3)) / 4)
+    z2 = ((3 * (y1 * y1)) / 4 - 2 * y1 * y2 + (y1 * y3) / 2 + y2 * y2 - (y3 * y3) / 4)
     d1, d2 = (y1 + 2 * y2 - 3 * y3), (2 * y2 - 3 * y1 + y3)
-    with np.errstate(all="ignore"):
-        def div(a, b):
-            try:
-                return a / b
-            except ZeroDivisionError:
-                return complex(float("nan"), 0) if a == 0 else complex(math.copysign(float("inf"), a.real), 0)
-        pv = [-div(2 * s1, d1), div(2 * s1, d1), div(2 * y2 - 3 * y1 + y3 + 2 * s2, d2),
-              -div(3 * y1 - 2 * y2 - y3 + 2 * s2, d2)]
-        v = [div(2 * y1 * y2 - 3 * y1 * y3 + y1 * s1 - 2 * y2 * s1 + y3 * s1 + y1 ** 2, d1),
-             div(2 * y1 * y2 - 3 * y1 * y3 - y1 * s1 + 2 * y2 * s1 - y3 * s1 + y1 ** 2, d1),
-             y3 - s2 / 2 + div(2 * z2 ** 1.5, d2 ** 2) - div(2 * (y2 - y3) * s2, d2),
-             y3 + s2 / 2 - div(2 * z2 ** 1.5, d2 ** 2) + div(2 * (y2 - y3) * s2, d2)]
+    if z1 >= 0:
+        s1 = _F.pow(z1, 0.5)
+        pv = [_rdiv(-(2 * s1), d1), _rdiv(2 * s1, d1)]
+        v = [_rdiv(2 * y1 * y2 - 3 * y1 * y3 + y1 * s1 - 2 * y2 * s1 + y3 * s1 + y1 * y1, d1),
+             _rdiv(2 * y1 * y2 - 3 * y1 * y3 - y1 * s1 + 2 * y2 * s1 - y3 * s1 + y1 * y1, d1)]
+    else:
+        s1 = complex(z1) ** 0.5
+        pv = [_cdiv(-(2 * s1), d1), _cdiv(2 * s1, d1)]
+        v = [_cdiv(2 * y1 * y2 - 3 * y1 * y3 + y1 * s1 - 2 * y2 * s1 + y3 * s1 + y1 * y1, d1),
+             _cdiv(2 * y1 * y2 - 3 * y1 * y3 - y1 * s1 + 2 * y2 * s1 - y3 * s1 + y1 * y1, d1)]
+    if z2 >= 0:
+        s2, t2 = _F.pow(z2, 0.5), _F.pow(z2, 1.5)
+        pv += [_rdiv(2 * y2 - 3 * y1 + y3 + 2 * s2, d2), _rdiv(-(3 * y1 - 2 * y2 - y3 + 2 * s2), d2)]
+        v += [y3 - s2 / 2 + _rdiv(2 * t2, d2 * d2) - _rdiv(2 * (y2 - y3) * s2, d2),
+              y3 + s2 / 2 - _rdiv(2 * t2, d2 * d2) + _rdiv(2 * (y2 - y3) * s2, d2)]
+    else:
+        s2, t2 = complex(z2) ** 0.5, complex(z2) ** 1.5
+        pv += [_cdiv(2 * y2 - 3 * y1 + y3 + 2 * s2, d2), _cdiv(-(3 * y1 - 2 * y2 - y3 + 2 * s2), d2)]
+        v += [y3 - s2 / 2 + _cdiv(2 * t2, d2 * d2) - _cdiv(2 * (y2 - y3) * s2, d2),
+              y3 + s2 / 2 - _cdiv(2 * t2, d2 * d2) + _cdiv(2 * (y2 - y3) * s2, d2)]
     vals = []
     for vi, pi in zip(v, pv):
-        x = -math.inf
-        if vi.imag == 0 and math.isfinite(vi.real):
-            x = vi.real
+        vi, pi = complex(vi), complex(pi)
+        x = vi.real if (vi.imag == 0 and math.isfinite(vi.real)) else -math.inf
         if pi.real < 0 or pi.real > 1:                                 # MATLAB compares real parts
             x = -math.inf
         vals.append(x)
     ip = int(np.argmax(vals))                                          # max: first of equal values
-    pos = pv[ip]
+    pos = complex(pv[ip])
     if ip < 2:
         pos = pos - 1
     if pos.imag != 0:
@@ -388,19 +398,22 @@ def peak_subpixel(vol, vol0=None):
 # =====================================================================================================================
 
 def local_correlation(small_template, small_mask, conjP, conjP2, want_matrix):
+    """local_correlation_general with MATLAB's numerics (pydyn.matlab_numerics: sequential mean and sum, FFTW
+    fftn / ifftn as MATLAB calls it, MATLAB's complex multiply); conjP / conjP2 = MN.conj of the spectra."""
     m = (small_mask == 1).astype(np.float64)
     t = small_template * m
     idx = m != 0
-    t[idx] = t[idx] - np.mean(t[idx])
+    t[idx] = t[idx] - MN.mmean(t[idx])
     nmask = int(idx.sum())
-    norm_t = math.sqrt(float(np.sum(t[idx] ** 2)))
+    x = t[idx]
+    norm_t = math.sqrt(MN.msum(x * x))
     tp = t * m
-    P1 = _fftn(tp)
-    PM = _fftn(m)
-    mc1 = np.real(_ifftn(P1 * conjP))
-    mcn = np.real(_ifftn(PM * conjP2))
-    mca = np.real(_ifftn(PM * conjP))
-    joint = mcn - mca * mca / nmask
+    P1 = MN.fftn(tp)
+    PM = MN.fftn(m)
+    mc1 = MN.ifftn_real(MN.cmul(P1, conjP))
+    mcn = MN.ifftn_real(MN.cmul(PM, conjP2))
+    mca = MN.ifftn_real(MN.cmul(PM, conjP))
+    joint = mcn - 1 * (mca * mca) / nmask
     # sqrt of a negative value is imaginary in MATLAB; real(i*s*norm) = 0, which is then a 'problem' entry
     with np.errstate(invalid="ignore"):
         final = np.where(joint >= 0, np.sqrt(np.where(joint >= 0, joint, 0)) * norm_t, 0.0)
@@ -455,7 +468,7 @@ def align_motor(scard, template, mask, conjP, conjP2, angles, ptable_input):
     best_ang, best_pos = None, None
     for i, (td, ti, na) in enumerate(angles):
         rt_raw, rmask = mex_shift_rot(template, (td, ti, na), (0, 0, 0), option=1, outscope=0.0, mask=mask)
-        rt = np.real(_ifftn(_fftn(rt_raw)))                        # dynamo_applyfiltermask(., ones)
+        rt = MN.ifftn_real(MN.fftn(rt_raw))                        # dynamo_applyfiltermask(., ones)
         if modus == 0:
             cc, pos, _ = local_correlation(rt, rmask, conjP, conjP2, False)
         else:
@@ -546,11 +559,11 @@ def dynamo_align(particle, template, vpr, settings_round, mask=None, verbose=Tru
         print(" Assuming full Fourier sampling by default (no pfmask passed)")
     ptable[12] = 0                                                       # pfmask struct 'full' (:1258-1262)
     # filtermask_data = ones: particle_transformed = real(ifftn(fftn(p) .* fftshift(ones)))  (:1338-1340)
-    pt = np.real(_ifftn(_fftn(particle)))
+    pt = MN.ifftn_real(MN.fftn(particle))
     pt = normalize_whole(pt)                                             # reproduce_pipeline :1796
-    P = _fftn(pt)
-    P2 = _fftn(pt ** 2)
-    conjP, conjP2 = np.conj(P), np.conj(P2)
+    P = MN.fftn(pt)
+    P2 = MN.fftn(pt * pt)
+    conjP, conjP2 = MN.conj(P), MN.conj(P2)
     scard = {"use_CC": q["use_CC"], "localnc": q["localnc"], "area_search": np.asarray(q["area_search"], float),
              "area_search_modus": q["area_search_modus"], "feature_data_sidelength": n}
     levels, ccmax, cclist, alist = [], [], [], [angles]

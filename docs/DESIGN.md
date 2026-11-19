@@ -18,7 +18,8 @@ pyDynamo re-implements Dynamo 1.1.514 by reverse engineering it. Every behaviour
 - `log.txt` line for line, except values that also differ between two Dynamo runs (dates, durations, GPU model);
 - the `.exe` byte-identical to the one Dynamo writes;
 - tables and averages bit-identical to Dynamo's on the same GPU model (with adaptive_bandpass = 1, the reference-2
-  realignment matches to round-off only, pydyn/dalign.py).
+  realignment, pydyn/dalign.py, is bit-identical to Dynamo on the same machine; Dynamo's own result for that step
+  varies between machines by up to about 1e-12; box sizes that are not a power of two are not verified).
 
 ## How each requirement is met, and what is missing
 
