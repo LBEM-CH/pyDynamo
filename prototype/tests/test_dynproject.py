@@ -327,7 +327,7 @@ def test_average_chains_one_state_through_the_workers_in_ascending_tag_order(mon
     pr.p = lambda *a: "mask.em"
     monkeypatch.setattr(dp.dynio, "read_em", lambda f: np.ones((n, n, n), np.float32))
     monkeypatch.setattr(AV, "new_state", lambda n: {"k": 0})
-    monkeypatch.setattr(AV, "finalize", lambda state, nh, mask, n, fmin, sym: (state, nh.tolist()))
+    monkeypatch.setattr(AV, "finalize", lambda state, nh, mask, n, fmin, sym, threads=1: (state, nh.tolist()))
     tags = [40, 2, 31, 5, 12, 9, 30, 7, 11]
     T = np.zeros((len(tags), 35))
     T[:, 0], T[:, 2] = tags, 1

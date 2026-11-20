@@ -188,3 +188,15 @@ def test_matlab_threads_override(monkeypatch):
     monkeypatch.setenv("PYDYN_MATLAB_THREADS", "0")
     with pytest.raises(ValueError):
         MN.matlab_threads()
+
+
+@needs_fix
+def test_parfor_subranges_as_matlab():
+    """MATLAB's parfor subranges (pool of W workers, 1:N), measured for W = 8, 16, 50, 64 and 49 values of N."""
+    parts = REF["parfor_subranges"]["partitions"]
+    assert len(parts) == 196
+    for key, rle in parts.items():
+        W, N = (int(v) for v in key.split(","))
+        want = [int(s) for r in rle.split() for s in [r.split("x")[0]] * int(r.split("x")[1])]
+        assert MN.parfor_subranges(N, W) == want, key
+        assert sum(want) == N

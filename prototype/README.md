@@ -163,15 +163,31 @@ at the end of each iteration's assembly.
 
 ### Averaging
 
-The averages are bit-identical to Dynamo's single-threaded MATLAB: Dynamo's kernel executables (set-up, compute,
-assemble) run MATLAB with `-singleCompThread`. pyDynamo reproduces this in four ways:
-- it uses sequential double sums (`pydyn/matlab_numerics.py`);
+The averages are bit-identical to Dynamo's when `matlab_workers_average` is 0. For `standalone_gpu`, Dynamo runs
+set-up and assembly (and so the averaging and the adaptive bandpass) inside `dynamo_execute_project`, where MATLAB
+uses one computational thread per core; its sums over 89,000 or more elements depend on that count. pyDynamo
+reproduces this in four ways:
+- it uses MATLAB's sums for the same thread count, `--matlab-threads` above (`pydyn/matlab_numerics.py`);
 - it adds the particles in ascending tag order and passes one running state through the GPU workers;
 - it normalises each particle with MATLAB's sums;
 - it computes `fftn` / `ifftn` with MATLAB's own sequence of FFTW calls (1-D transforms one dimension at a time,
   4 lines per plan, read from MATLAB with an FFTW call logger; `pydyn/masks.py`).
-`dynamo_execute_project` itself, where the adaptive bandpass runs, is compiled without that flag; see
-`--matlab-threads` above.
+
+With `matlab_workers_average` > 0, Dynamo averages each half on a pool of single-threaded MATLAB workers (a
+`parfor` loop). MATLAB splits the particles into subranges, each worker adds its subranges, and the partial sums are
+added in the order the workers finish. That order changes from run to run, so Dynamo does not repeat its own
+averages in double precision. In measured cases, three or four Dynamo re-averages of the same particles (9,422 and
+9,965 particles, 50 workers) differed from each other in about 90 % of the voxels, by up to 1.1e-14, and all rounded
+to the same float32 file. pyDynamo splits the particles into MATLAB's subranges (`matlab_numerics.parfor_subranges`,
+measured in MATLAB for 8 to 64 workers and 1 to 30,000 particles). It adds each subrange in MATLAB's descending
+order with one thread, then adds the subrange sums in order (`average.pool_sums`). Its averages fall within Dynamo's
+own run-to-run spread, and its float32 files matched Dynamo's in every measured case.
+
+The even/odd FSC can still differ in its last points. Its last shell (radius n/2 to n/2 + 2, the corners beyond
+Nyquist) has Fourier weight 0 in the measured projects, so Dynamo sets those components to 0, and the shell keeps
+only rounding noise. Its FSC value, which the last two or three points of `eo_fsc` interpolate (points 30 to 32 of
+32 for box 64), changes with any change in the last bit of the half maps. It changes between Dynamo's own pooled
+runs, and between pyDynamo and Dynamo. Without a pool, these points are bit-identical too.
 
 FFTW is loaded through ctypes: `$PYDYN_FFTW_LIB` if it is set (then only that library is tried), else the system's
 `libfftw3.so.3`. No MATLAB library is used. In measurements, the system FFTW 3.3.8 gave the same bits as MATLAB's own
@@ -212,7 +228,7 @@ and cos differ from MATLAB's in about 3 % of the arguments. sin and cos of argum
 | unfold, seed file that is a symbolic link | copies the link, then writes through it | copies the content (and says so) |
 | `dvput` when the project at `vpr.path` does not exist | creates it | raises; use `dcp.put` or set `path` |
 | `dvcheck` GPU-motor check | looks for `dynamo_compute_iteration_<gpu_motor>` | CuPy importable and `gpu_motor` `'spp'` |
-| `matlab_workers_average` > 0 | opens a MATLAB pool | no pool; averaging runs on the GPU workers |
+| `matlab_workers_average` > 0 | opens a MATLAB pool; the averages' last double bits and the last 2–3 `eo_fsc` points change from run to run | no pool; the GPU workers sum in MATLAB's `parfor` subranges: same float32 averages, last `eo_fsc` points differ as between two Dynamo runs (see Averaging) |
 | dcp's rounds-table edits (`getVpr`) | write `./decoy/settings/virtual_project.mat` | no `./decoy` folder |
 | GUI strings (`str2num`) | any MATLAB expression | numbers, Inf/NaN, true/false, vectors and integer `a:b` / `a:s:b` ranges; anything else raises |
 | GPUs used | `gpu_identifier_set` | the same by default; `--gpus LIST` or `--gpus all` overrides it (the particle split still follows `gpu_identifier_set`) |
@@ -329,7 +345,7 @@ PYDYN_GPU_TESTS=1 python -I -m pytest -m gpu prototype/tests    # GPU tests: opt
 | `pydyn/balancer.py` | GPU memory balancer: the largest batch that fits, halved on out-of-memory (`fast` engine) |
 | `pydyn/angles.py` | Dynamo's GPU orientation generator, with C float semantics through glibc |
 | `pydyn/average.py` | Dynamo's pipeline average on the GPU: ordered sums, wedges, finalize (average, weights, eo FSC); the console `daverage` sums |
-| `pydyn/matlab_numerics.py` | Single-thread MATLAB numerics: sequential sums, mean and std, FFTW `fftn` / `ifftn`, FSC, `linspace`, `interp1` |
+| `pydyn/matlab_numerics.py` | MATLAB numerics: sums for a given thread count, mean and std, FFTW `fftn` / `ifftn`, FSC, `linspace`, `interp1`, `parfor` subranges |
 | `pydyn/fdlibm.py` | fdlibm's sin, cos, atan, atan2 and acos (MATLAB's scalar trigonometry), bit for bit |
 | `pydyn/masks.py` | `default_mask`, `dmask` (cylinder), `dmollify`, `dcylinder`, the mask editor's state, MATLAB's `exp`, the FFTW loader |
 | `pydyn/symmetry.py` | `dynamo_sym`: c, d and helical symmetry operators, with symmetrized Fourier weights |

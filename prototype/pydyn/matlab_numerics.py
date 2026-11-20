@@ -1,11 +1,14 @@
 """MATLAB numerics as Dynamo 1.1.514's executables compute them, bit for bit.
 
 MATLAB's thread count matters for sums. Dynamo's kernel executables (dynamo_iteration_setup / _compute / _assemble /
-_check: the set-up, the averaging) are compiled with `-R -singleCompThread` (matlab/src/dynamo_compile.m:377-387 for
-targets with graphics = 0, matlab/src/+dpkdev/+compile/convention.m read_group3), so MATLAB runs single-threaded
-there. dynamo_execute_project itself (graphics = 1, convention.m) is not: the post-processing that runs inside it
-(the adaptive bandpass and its ref2 -> ref1 realignment, dynamo_align) uses MATLAB's default thread count, one per
-available core (measured: a run in a 16-core job is reproduced by maxNumCompThreads(16) and by no other count).
+_check) are compiled with `-R -singleCompThread` (matlab/src/dynamo_compile.m:377-387 for targets with graphics = 0,
+matlab/src/+dpkdev/+compile/convention.m read_group3), but a standalone_gpu project does not run them: its .exe runs
+dynamo_execute_project (graphics = 1, no such flag), which calls set-up, assembly (the averaging) and the adaptive
+bandpass (its ref2 -> ref1 realignment, dynamo_align) as functions in its own process, with MATLAB's default thread
+count, one per available core (measured: a run in a 16-core job is reproduced by maxNumCompThreads(16) and by no
+other count; a 64-thread average of 9,965 particles of 64^3 reproduced bit for bit in double). With
+matlab_workers_average > 0, dynamo_average runs its particle and weight loops as parfor loops on a pool of
+single-threaded workers (parfor_subranges).
 Measured in the Dynamo 1.1.514 MATLAB runtime (R2019a):
 * sum(x) of a double vector with T threads: n < 89,000 or T = 1 -> strictly sequential, left to right from 0;
   otherwise T chunks of floor(n/T) summed sequentially, the chunk sums added in order, then the n mod T last
@@ -19,6 +22,11 @@ Measured in the Dynamo 1.1.514 MATLAB runtime (R2019a):
   thread count); the system FFTW 3.3.8 gives the same bits as MATLAB's own FFTW 3.3.3, so no MATLAB library is
   needed.
 * MATLAB's sum rule (n >= 89,000 chunked by threads) is verified for n up to 33,000,000 and T = 1, 2, 3, 4, 7, 16, 64.
+* parfor on a pool of W workers splits 1:N into fixed subranges (parfor_subranges; measured for W = 8, 16, 50, 64 and
+  49 values of N from 1 to 30,000, all identical to the rule); a worker runs a subrange's iterations in descending
+  order, and a sum reduction adds each subrange's partial sum to the client's variable. The client usually adds
+  the partial sums in subrange order; a subrange that finishes out of turn can be merged with its neighbour first,
+  so the last bits of a pool's sum change from run to run (MATLAB itself does not repeat them).
 NumPy's sum / mean / std use pairwise orders and NumPy's FFT is pocketfft; both differ in the last bits, which is
 enough to change float32 voxels of Dynamo's averages and the noise-level shells of an FSC. MATLAB's linear index
 order of an [x, y, z] array is the C order of pyDynamo's [z, y, x] arrays, so flat order = MATLAB order.
@@ -27,6 +35,35 @@ import numpy as np
 
 
 THREADED_SUM_MIN = 89000
+
+
+def _mround(x):
+    """MATLAB round: halves away from zero."""
+    import math
+    return math.floor(x + 0.5) if x >= 0 else -math.floor(-x + 0.5)
+
+
+def parfor_subranges(N, W):
+    """Sizes of the subranges into which MATLAB R2019a's parfor splits 1:N on a pool of W workers, in loop order:
+    a first group of W subranges of c0 = ceil(N / (20 W)); then groups of W subranges of max(c0, round(R / (2 W)))
+    for the R iterations left; when a group would leave fewer than W iterations, the R left are split into W
+    subranges of floor(R / W) and floor(R / W) + 1 (the smaller first; empty ones dropped). Measured
+    (benchmarks/19_parfor, worker id and time of every iteration): 196 of 196 partitions identical."""
+    import math
+    N, W = int(N), int(W)
+    if N <= 0:
+        return []
+    c0 = max(1, math.ceil(N / (20 * W)))
+    sizes, R, s = [], N, c0
+    while R > 0:
+        if R - W * s < W:
+            q, r = divmod(R, W)
+            sizes += [z for z in [q] * (W - r) + [q + 1] * r if z > 0]
+            break
+        sizes += [s] * W
+        R -= W * s
+        s = max(c0, _mround(R / (2 * W)))
+    return sizes
 
 
 def matlab_threads():

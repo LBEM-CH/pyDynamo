@@ -318,11 +318,11 @@ def ellipsoid_inside(n, radius):
     return ((rx / radius) ** 2 + (ry / radius) ** 2 + (rz / radius) ** 2) <= 1
 
 
-def normalize_roi(v, mask):
+def normalize_roi(v, mask, threads=1):
     """dynamo_normalize_roi.m:130-184: roi = v[mask != 0] without NaN; (v - mean) / std(roi - mean), with
-    single-thread MATLAB's sequential sums (pydyn.matlab_numerics)."""
+    MATLAB's sums for `threads` computational threads (pydyn.matlab_numerics)."""
     from .matlab_numerics import normalize_roi as _n
-    return _n(v, mask)
+    return _n(v, mask, threads)
 
 
 # =================================================================================================
@@ -401,7 +401,7 @@ def _gpu_worker(device, conn, cfg):
         from . import emio
         from .card import Card
         from .engine import Engine
-        from .average import ordered_sums
+        from .average import ordered_sums, pool_sums
         cp.cuda.Device(device).use()
     except Exception:
         conn.send({"ok": False, "error": traceback.format_exc()})
@@ -508,8 +508,12 @@ def _gpu_worker(device, conn, cfg):
                 pidx = np.array([pos[int(t)] for t in rows[:, 0]], dtype=np.int64)
                 contiguous = len(pidx) > 0 and np.array_equal(pidx, np.arange(pidx[0], pidx[0] + len(pidx)))
                 parts = st["particles"][pidx[0]:pidx[0] + len(pidx)] if contiguous else st["particles"][pidx]
-                state = ordered_sums(parts, rows.astype(np.float32), msg["half"], msg["nh"],
-                                     msg["mask"], msg["state"])
+                if msg.get("pieces") is None:
+                    state = ordered_sums(parts, rows.astype(np.float32), msg["half"], msg["nh"],
+                                         msg["mask"], msg["state"], threads=int(msg.get("threads", 1)))
+                else:                                          # MATLAB pool: parfor subranges (average.pool_sums)
+                    state = pool_sums(parts, rows.astype(np.float32), msg["half"], msg["nh"], msg["mask"],
+                                      msg["state"], msg["pieces"], threads=int(msg.get("threads", 1)))
                 cp.cuda.Device().synchronize()
                 cp.fft.config.get_plan_cache().clear()
                 cp.get_default_memory_pool().free_all_blocks()
@@ -971,7 +975,7 @@ class DynamoProject:
             T = dynamo_sym(T, op, fb if with_fmask else None)[0]
             shell = isotropic_shell(L, high, low, 2.0)               # dynamo_bandpass smp = 2
             T = bandpass_filter(T, np.fft.fftshift(shell))             # real(ifftn(fftn(T).*shell)), FFTW
-            T = normalize_roi(T, mask_bin)
+            T = normalize_roi(T, mask_bin, self._mthreads())                # setup runs in dynamo_execute_project
             dynio.write_em(self.p(self.r_template_transformed(ref, ite)), T)
 
     def setup_gpu(self, ite, refs):
@@ -1294,6 +1298,15 @@ class DynamoProject:
         dynio.write_txt(self.p("next_iteration.txt"), self.N + 1)
         self.append_log(dynlog.assemble_fatal_lines(ite, reason))
 
+    def _mthreads(self):
+        """MATLAB computational threads of Dynamo's dynamo_execute_project to reproduce (--matlab-threads; default
+        MATLAB's own, one per available physical core)."""
+        t = getattr(self, "matlab_threads", None)
+        if not t:
+            from .matlab_numerics import matlab_threads
+            t = matlab_threads()
+        return int(t)
+
     def average_from_table(self, ite, ref, table, fsc_sym=None):
         """The dynamo_average call of pipeline/average.m and genericInput2Average.m (06b 7): rows with col 3 == 1,
         nmask = settings/mask.em (raw), fmin 3, even/odd halves of the sorted tags. `table` is used as given (the
@@ -1324,20 +1337,64 @@ class DynamoProject:
         tags = rows[:, 0].astype(np.int64)
         if any(int(t) not in owner for t in tags):
             raise RuntimeError("averaging tags are not all resident on the GPU workers")
-        # runs of consecutive tags held by the same worker; the state goes through them in order (one serial sum
-        # per half, as dynamo_average's single-thread loop)
+        # MATLAB threads (benchmarks/14_msa_b4/abp_probe, 18_untested): dynamo_average runs inside
+        # dynamo_execute_project, one computational thread per core. Without a pool: runs of consecutive tags held
+        # by the same worker, the state going through them in order (one serial sum per half, as dynamo_average's
+        # serial loop). With matlab_workers_average > 0 Dynamo opens a parpool and the particle and weight loops
+        # are parfor loops on its single-threaded workers (below). The finalisation always runs in the main process.
+        W = int(float((getattr(self, "vpr", None) or {}).get("matlab_workers_average", 0) or 0))
         w_of = np.array([owner[int(t)] for t in tags])
-        cuts = np.flatnonzero(np.diff(w_of)) + 1
-        state = new_state(n)
-        for a, b in zip(np.r_[0, cuts], np.r_[cuts, len(rows)]):
-            dev, conn, _ = self.workers[int(w_of[a])]
-            conn.send({"op": "average", "rows": rows[a:b], "half": half[a:b], "nh": nh,
-                       "mask": mask.astype(np.float32), "state": state, "slot": ref})
-            r = conn.recv()
-            if not r.get("ok"):
-                raise RuntimeError("GPU worker on device %d failed:\n%s" % (dev, r.get("error")))
-            state = r["state"]
-        return finalize(state, nh, mask, n, fmin=3.0, sym=fsc_sym)
+        m32 = mask.astype(np.float32)
+        if W <= 0:
+            cuts = np.flatnonzero(np.diff(w_of)) + 1
+            state = new_state(n)
+            for a, b in zip(np.r_[0, cuts], np.r_[cuts, len(rows)]):
+                dev, conn, _ = self.workers[int(w_of[a])]
+                conn.send({"op": "average", "rows": rows[a:b], "half": half[a:b], "nh": nh,
+                           "mask": m32, "state": state, "slot": ref, "threads": self._mthreads()})
+                r = conn.recv()
+                if not r.get("ok"):
+                    raise RuntimeError("GPU worker on device %d failed:\n%s" % (dev, r.get("error")))
+                state = r["state"]
+        else:
+            # dynamo_average with a pool: per half, MATLAB's parfor subranges of the half's ascending tags
+            # (matlab_numerics.parfor_subranges), each run in descending order on a single-threaded worker, the
+            # partial sums added in subrange order (MATLAB's usual order; benchmarks/19_parfor). A subrange split
+            # between GPU workers continues its partial sum through them.
+            from .average import new_pool_state
+            from .matlab_numerics import parfor_subranges
+            order, pieces = [], []                               # processing order (row index) and pieces over it
+            for k in (0, 1):
+                idx = np.flatnonzero(half == k)
+                a = 0
+                for size in parfor_subranges(len(idx), W):
+                    sub = idx[a:a + size][::-1]
+                    a += size
+                    cut = np.flatnonzero(np.diff(w_of[sub])) + 1
+                    bounds = list(zip(np.r_[0, cut], np.r_[cut, len(sub)]))
+                    for j, (u, v) in enumerate(bounds):
+                        pieces.append([len(order), len(order) + v - u, k, j == 0, j == len(bounds) - 1])
+                        order.extend(sub[u:v].tolist())
+            order = np.asarray(order, dtype=np.int64)
+            state = new_pool_state(n)
+            g = 0
+            while g < len(pieces):                               # consecutive pieces on one worker: one message
+                w = int(w_of[order[pieces[g][0]]])
+                h = g
+                while h < len(pieces) and int(w_of[order[pieces[h][0]]]) == w:
+                    h += 1
+                p0, p1 = pieces[g][0], pieces[h - 1][1]
+                sel = order[p0:p1]
+                rel = [(q[0] - p0, q[1] - p0, q[2], q[3], q[4]) for q in pieces[g:h]]
+                dev, conn, _ = self.workers[w]
+                conn.send({"op": "average", "rows": rows[sel], "half": half[sel], "nh": nh, "mask": m32,
+                           "state": state, "slot": ref, "threads": 1, "pieces": rel})
+                r = conn.recv()
+                if not r.get("ok"):
+                    raise RuntimeError("GPU worker on device %d failed:\n%s" % (dev, r.get("error")))
+                state = r["state"]
+                g = h
+        return finalize(state, nh, mask, n, fmin=3.0, sym=fsc_sym, threads=self._mthreads())
 
     def average(self, ite, ref):
         """dpkproject.pipeline.average (06b 7): table = the refined_table TEXT after thresholding, tags col3 == 1,

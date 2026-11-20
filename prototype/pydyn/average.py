@@ -6,9 +6,13 @@ of their half (odd/even by position in the ascending tag list):
 * C = number of NaN contributions per voxel;
 * F = sum of rotated wedges / Ntags.
 The project runner chains one state through its GPU workers in tag order, so each half is one sequential double
-sum as in dynamo_average's single-thread MATLAB loop (dynamo_iteration_assemble runs -singleCompThread); the per-particle
-normalisation uses MATLAB's sequential sums (pydyn.matlab_numerics), and the FFTs are MATLAB's FFTW. Checked byte
-for byte against the user's Dynamo averages (benchmarks/12_avg_order). `finalize` computes the outputs Dynamo
+sum as in dynamo_average's serial loop; the normalisations use MATLAB's sums for the thread count of the process
+that runs them (pydyn.matlab_numerics.msum: dynamo_execute_project, which runs setup and assemble in its own
+process, has one thread per core; the workers of a MATLAB pool, matlab_workers_average > 0, have one), and the FFTs
+are MATLAB's FFTW. With a pool (matlab_workers_average > 0) dynamo_average's loops are parfor loops: `pool_sums`
+reproduces MATLAB's subranges (matlab_numerics.parfor_subranges), each summed in descending order, and MATLAB's
+usual order of adding their partial sums; MATLAB can merge a subrange that finishes out of turn with its
+neighbour first, so Dynamo's own doubles change from run to run by a few ulps. `finalize` computes the outputs Dynamo
 writes: average, average_unweighted, fweight_average_raw, fmask_average and eo_fsc.
 
 Rotations follow dynamo_shift_rot_mex exactly (08b 4.4; mex/src/classes/volume_float.cpp:416-620): the particle with
@@ -87,61 +91,112 @@ def new_state(n):
     return {"S": np.zeros((2, N)), "C": np.zeros((2, N)), "F": np.zeros((2, N))}
 
 
-def ordered_sums(particles, rows, half, nh, mask, state, batch=None):
-    """Add particles to the running sums of their half, in the order given, as dynamo_average does in single-thread
-    MATLAB (dynamo_average.m alignParticle :2647-2681, main loop :1974-1997, weight loop :2167-2187):
+class _Accumulator:
+    """The per-particle work of dynamo_average's loops on the GPU for `particles` / `rows` (mex-exact rotations,
+    dynamo_normalize_roi with `threads` MATLAB threads, rotated wedges / Ntags); add(b0, b1, S, C, F) adds particles
+    b0..b1-1, in that order, to the device sums S, C, F [2, n^3] of their half."""
+
+    def __init__(self, particles, rows, half, nh, mask, batch=None, threads=1):
+        self.particles, self.n = particles, particles.shape[1]
+        P, n = len(rows), self.n
+        self.N = N = n ** 3
+        self.idx = cp.asarray(np.flatnonzero(np.asarray(mask).ravel() != 0))
+        self.nvox = nvox = int(self.idx.size)
+        keys, self.widx = {}, np.zeros(P, dtype=np.int64)
+        for p in range(P):
+            key = (int(rows[p, 12]),) + tuple(float(x) for x in rows[p, 13:19])
+            self.widx[p] = keys.setdefault(key, len(keys))
+        self.Wstack = cp.asarray(np.stack([wedge_mask(n, np.array([0] * 12 + list(k) + [0] * 16, dtype=np.float32))
+                                           for k in keys])) if P else None
+        self.mats, self.shifts = mex_matrices(rows)
+        self.nh_d = cp.asarray(np.asarray(nh, dtype=np.float64))
+        self.half = np.asarray(half, dtype=np.int32)
+        self.threads = int(threads)
+        self.k = [_mex_kernel(k) for k in ("shiftrot_mex4", "rot_mex0", "roi_moments", "accum_ordered")]
+        if batch is None:                               # from free GPU memory; the sums' order does not depend on it
+            per = 4 * N * 4 + nvox * (4 + 8 + 8)        # in/out/wedge float32 [B, N], gathered ROI float32/64 + transpose
+            free = cp.cuda.Device().mem_info[0] + cp.get_default_memory_pool().free_bytes()
+            batch = max(1, min(256, int(0.5 * free) // per))
+        self.batch = int(batch)
+
+    def add(self, p0, p1, S, C, F):
+        kr, kw, km, ka = self.k
+        n, N, nvox = self.n, self.N, self.nvox
+        for b0 in range(p0, p1, self.batch):
+            b1 = min(p1, b0 + self.batch)
+            B = b1 - b0
+            M = cp.asarray(self.mats[b0:b1].ravel())
+            out = cp.empty((B, n, n, n), dtype=cp.float32)
+            kr(((B * N + 255) // 256,), (256,), (cp.asarray(self.particles[b0:b1], dtype=cp.float32), M,
+                                                 cp.asarray(self.shifts[b0:b1].ravel()), out, np.int32(n),
+                                                 np.int64(B * N)))
+            V = out.reshape(B, N)
+            X = cp.nan_to_num(V[:, self.idx].astype(cp.float64), copy=False, nan=0.0).T.copy()  # [nvox, B], r(nan) = 0
+            mu, sd = cp.empty(B, cp.float64), cp.empty(B, cp.float64)
+            km(((B + 127) // 128,), (128,), (X, np.int32(B), np.int64(nvox), mu, sd, np.int32(self.threads)))
+            del X
+            R = cp.empty((B, n, n, n), dtype=cp.float32)
+            kw(((B * N + 255) // 256,), (256,), (self.Wstack, cp.asarray(self.widx[b0:b1]), M, R, np.float32(0.0),
+                                                 np.int32(n), np.int64(B * N)))
+            ka(((N + 255) // 256,), (256,), (V, R.reshape(B, N), mu, sd, cp.asarray(self.half[b0:b1]), self.nh_d,
+                                             np.int32(B), np.int64(N), S, C, F))
+            del out, R
+
+
+def ordered_sums(particles, rows, half, nh, mask, state, batch=None, threads=1):
+    """Add particles to the running sums of their half, in the order given, as dynamo_average's serial loop does
+    (dynamo_average.m alignParticle :2647-2681, main loop :1974-1997, weight loop :2167-2187):
       r = sharpShiftRot(p, -t(4:6), -t(9:-1:7))     mex option 4 (NaN outside the box)
       nanmap = isnan(r); r(nanmap) = 0; r = dynamo_normalize_roi(r, mask); r(nanmap) = 0
       S += r; C += nanmap; F += dynamo_rot(wedge, -t(9:-1:7)) / Ntags
     The caller passes the particles in ascending tag order (intersect() in dynamo_average.m:1301) and chains the
     state through every GPU worker in that order, so each half is one sequential sum as in Dynamo.
     particles [P, n, n, n] float32 (host or device); rows [P, cols]; half[P] in {0, 1}; nh = (Ntags_odd,
-    Ntags_even) of the whole average; mask: the project mask (find(mask) = voxels != 0). Returns the new state."""
+    Ntags_even) of the whole average; mask: the project mask (find(mask) = voxels != 0); threads: MATLAB's
+    computational threads for the sums of dynamo_normalize_roi (matlab_numerics.msum; they change the bits only for
+    masks of 89,000 voxels or more). Returns the new state."""
     t0 = time.perf_counter()
-    P, n = len(rows), particles.shape[1]
-    N = n ** 3
-    idx = cp.asarray(np.flatnonzero(np.asarray(mask).ravel() != 0))
-    nvox = int(idx.size)
-    keys, widx = {}, np.zeros(P, dtype=np.int64)
-    for p in range(P):
-        key = (int(rows[p, 12]),) + tuple(float(x) for x in rows[p, 13:19])
-        widx[p] = keys.setdefault(key, len(keys))
-    Wstack = cp.asarray(np.stack([wedge_mask(n, np.array([0] * 12 + list(k) + [0] * 16, dtype=np.float32)) for k in keys])) \
-        if P else None
-    mats, shifts = mex_matrices(rows)
+    acc = _Accumulator(particles, rows, half, nh, mask, batch=batch, threads=threads)
     S, C, F = (cp.asarray(state[k]) for k in ("S", "C", "F"))
-    nh_d = cp.asarray(np.asarray(nh, dtype=np.float64))
-    half = np.asarray(half, dtype=np.int32)
-    kr, kw, km, ka = (_mex_kernel(k) for k in ("shiftrot_mex4", "rot_mex0", "roi_moments", "accum_ordered"))
-    if batch is None:                                   # from free GPU memory; the sums' order does not depend on it
-        per = 4 * N * 4 + nvox * (4 + 8 + 8)            # in/out/wedge float32 [B, N], gathered ROI float32/64 + transpose
-        free = cp.cuda.Device().mem_info[0] + cp.get_default_memory_pool().free_bytes()
-        batch = max(1, min(256, int(0.5 * free) // per))
-    for b0 in range(0, P, int(batch)):
-        b1 = min(P, b0 + int(batch))
-        B = b1 - b0
-        M = cp.asarray(mats[b0:b1].ravel())
-        out = cp.empty((B, n, n, n), dtype=cp.float32)
-        kr(((B * N + 255) // 256,), (256,), (cp.asarray(particles[b0:b1], dtype=cp.float32), M,
-                                             cp.asarray(shifts[b0:b1].ravel()), out, np.int32(n), np.int64(B * N)))
-        V = out.reshape(B, N)
-        X = cp.nan_to_num(V[:, idx].astype(cp.float64), copy=False, nan=0.0).T.copy()   # [nvox, B], r(nanmap) = 0
-        mu, sd = cp.empty(B, cp.float64), cp.empty(B, cp.float64)
-        km(((B + 127) // 128,), (128,), (X, np.int32(B), np.int64(nvox), mu, sd))
-        del X
-        R = cp.empty((B, n, n, n), dtype=cp.float32)
-        kw(((B * N + 255) // 256,), (256,), (Wstack, cp.asarray(widx[b0:b1]), M, R, np.float32(0.0), np.int32(n),
-                                             np.int64(B * N)))
-        ka(((N + 255) // 256,), (256,), (V, R.reshape(B, N), mu, sd, cp.asarray(half[b0:b1]), nh_d, np.int32(B),
-                                         np.int64(N), S, C, F))
-        del out, R
+    acc.add(0, len(rows), S, C, F)
     cp.cuda.Device().synchronize()
     return {"S": S.get(), "C": C.get(), "F": F.get(), "seconds": time.perf_counter() - t0}
 
 
-def normalize_roi(v, mask):
-    """dynamo_normalize_roi(v, mask) in single-thread MATLAB (pydyn.matlab_numerics)."""
-    return MN.normalize_roi(v, mask)
+def new_pool_state(n):
+    """new_state plus the partial sums of the parfor subrange in progress (pS, pC, pF)."""
+    st = new_state(n)
+    st.update({"p" + k: np.zeros_like(st[k]) for k in ("S", "C", "F")})
+    return st
+
+
+def pool_sums(particles, rows, half, nh, mask, state, pieces, batch=None, threads=1):
+    """dynamo_average's parfor loops (matlab_workers_average > 0; matlab_numerics.parfor_subranges): the particles
+    are given in processing order and `pieces` lists (p0, p1, k, first, last) over them: particles p0..p1-1 belong
+    to one subrange of half k, already in its descending iteration order; `first` starts that subrange's partial
+    sums from 0, `last` adds them to the half's sums (the client's average_raw + partial, in subrange order). The
+    same partition holds for the particle loop (S, C) and the weight loop (F), both over the half's tags. `threads`
+    is 1 on a pool's workers. state = new_pool_state(n) or a previous result; returns the new state."""
+    t0 = time.perf_counter()
+    acc = _Accumulator(particles, rows, half, nh, mask, batch=batch, threads=threads)
+    T = {k: cp.asarray(state[k]) for k in ("S", "C", "F", "pS", "pC", "pF")}
+    for p0, p1, k, first, last in pieces:
+        if first:
+            for key in ("pS", "pC", "pF"):
+                T[key][k] = 0.0
+        acc.add(int(p0), int(p1), T["pS"], T["pC"], T["pF"])
+        if last:
+            for key in ("S", "C", "F"):
+                T[key][k] = T[key][k] + T["p" + key][k]
+    cp.cuda.Device().synchronize()
+    out = {k: v.get() for k, v in T.items()}
+    out["seconds"] = time.perf_counter() - t0
+    return out
+
+
+def normalize_roi(v, mask, threads=1):
+    """dynamo_normalize_roi(v, mask) with MATLAB's sums for `threads` computational threads (pydyn.matlab_numerics)."""
+    return MN.normalize_roi(v, mask, threads)
 
 
 def fweight_divide(v, F, tau):
@@ -161,7 +216,7 @@ def fsc_fouriermask(a, b, ns):
     return MN.shell_fsc(a, b, shells)
 
 
-def finalize(state, nh, mask, n, fmin=3.0, sym=None):
+def finalize(state, nh, mask, n, fmin=3.0, sym=None, threads=1):
     """Dynamo's averaging outputs from the chained sums (dynamo_average.m FSC path, 05 3.5-3.8), float64, host:
     per half average_raw = normalize_roi(S ./ max(Ntags - C, 1)); fweight = F / max(F);
     average = normalize_roi(fweight_divide(average_raw, fweight, fthreshold)), fthreshold = fmin/Ntags (or 1/Ntags);
@@ -171,7 +226,9 @@ def finalize(state, nh, mask, n, fmin=3.0, sym=None):
     goes through dynamo_particle(half, 'actions', 'sym <op>;', 'fmask', binarize(half fmask, 0.5)) (fsc_local,
     dynamo_average.m:2808-2823), which is dynamo_sym(half, op, 'fmask', that fmask) [RUN: headless 1.1.514, max abs 0
     for h[-1.4,0.3] and c3 with a random binary fmask, i.e. with the Fourier division: benchmarks/06_abp_align_eo/implA/
-    particle_sym.m/.log]; c1 parses as 'none' (dynamo_zaux_parse_sym.m): no action."""
+    particle_sym.m/.log]; c1 parses as 'none' (dynamo_zaux_parse_sym.m): no action.
+    threads: MATLAB's computational threads of the process that runs this part (dynamo_execute_project: one per
+    core), for the sums of dynamo_normalize_roi."""
     S, C, F = state["S"], state["C"], state["F"]
     if min(int(nh[0]), int(nh[1])) < 1:
         raise NotImplementedError("finalize needs particles in both halves (the even/odd FSC path of dynamo_average)")
@@ -180,11 +237,11 @@ def finalize(state, nh, mask, n, fmin=3.0, sym=None):
         nk = int(nh[k])
         D = nk * np.ones(S.shape[1]) - C[k]
         D[D == 0] = 1
-        A_raw = normalize_roi((S[k] / D).reshape(n, n, n), mask)
+        A_raw = normalize_roi((S[k] / D).reshape(n, n, n), mask, threads)
         Fk = F[k].reshape(n, n, n)
         Fk = Fk / Fk.max()
         tau = (1.0 / nk) * fmin if fmin < nk else 1.0 / nk                  # dynamo_average.m:2215-2219
-        Ak = normalize_roi(fweight_divide(A_raw, Fk, tau), mask)
+        Ak = normalize_roi(fweight_divide(A_raw, Fk, tau), mask, threads)
         halves.append((A_raw, Fk, Ak, Fk >= tau))
     ns = n // 4
     vh = [halves[0][2], halves[1][2]]
@@ -317,21 +374,44 @@ void accum_serial(const float* V, double* S, double* C, const int B, const long 
     }
     S[v] = s; C[v] = c;
 }
+__device__ __forceinline__ double roi_term(const double* X, const int B, const int b, const long k, const int mode,
+                                           const double m, const double yb)
+{   // mode 0: x; 1: x - m; 2: ((x - m) - yb)^2
+    double x = X[k * B + b];
+    if (mode == 0) return x;
+    if (mode == 1) return __dsub_rn(x, m);
+    double d = __dsub_rn(__dsub_rn(x, m), yb);
+    return __dmul_rn(d, d);
+}
+__device__ double roi_sum(const double* X, const int B, const int b, const long n, const int T, const int mode,
+                          const double m, const double yb)
+{   // MATLAB's sum with T computational threads (pydyn.matlab_numerics.msum): sequential below 89,000 elements or
+    // for one thread; else T chunks of floor(n/T) summed from 0, chunk sums added in order, the tail one by one
+    if (T <= 1 || n < 89000) {
+        double s = 0.0;
+        for (long k = 0; k < n; k++) s = __dadd_rn(s, roi_term(X, B, b, k, mode, m, yb));
+        return s;
+    }
+    long q = n / T;
+    double r = 0.0;
+    for (int c = 0; c < T; c++) {
+        double p = 0.0;
+        for (long k = (long)c * q; k < (long)(c + 1) * q; k++) p = __dadd_rn(p, roi_term(X, B, b, k, mode, m, yb));
+        r = c == 0 ? p : __dadd_rn(r, p);
+    }
+    for (long k = (long)T * q; k < n; k++) r = __dadd_rn(r, roi_term(X, B, b, k, mode, m, yb));
+    return r;
+}
 extern "C" __global__
-void roi_moments(const double* X, const int B, const long n, double* mu, double* sd)
-{   // dynamo_normalize_roi_one in single-thread MATLAB: X is [n, B] (mask voxels in index order, one column per
-    // particle); miroi = sum(iroi)/n, y = iroi - miroi, stdiroi = sqrt(sum(abs(y - sum(y)/n).^2)/(n-1)); every sum
-    // sequential from 0, one rounding per operation.
+void roi_moments(const double* X, const int B, const long n, double* mu, double* sd, const int T)
+{   // dynamo_normalize_roi_one with T MATLAB computational threads: X is [n, B] (mask voxels in index order, one
+    // column per particle); miroi = sum(iroi)/n, y = iroi - miroi, stdiroi = sqrt(sum(abs(y - sum(y)/n).^2)/(n-1));
+    // every sum as MATLAB's (roi_sum), one rounding per operation.
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= B) return;
-    double s = 0.0;
-    for (long k = 0; k < n; k++) s = __dadd_rn(s, X[k * B + b]);
-    double m = __ddiv_rn(s, (double)n);
-    double s2 = 0.0;
-    for (long k = 0; k < n; k++) s2 = __dadd_rn(s2, __dsub_rn(X[k * B + b], m));
-    double yb = __ddiv_rn(s2, (double)n);
-    double s3 = 0.0;
-    for (long k = 0; k < n; k++) { double d = __dsub_rn(__dsub_rn(X[k * B + b], m), yb); s3 = __dadd_rn(s3, __dmul_rn(d, d)); }
+    double m = __ddiv_rn(roi_sum(X, B, b, n, T, 0, 0.0, 0.0), (double)n);
+    double yb = __ddiv_rn(roi_sum(X, B, b, n, T, 1, m, 0.0), (double)n);
+    double s3 = roi_sum(X, B, b, n, T, 2, m, yb);
     mu[b] = m;
     sd[b] = n > 1 ? __dsqrt_rn(__ddiv_rn(s3, (double)(n - 1))) : 0.0;
 }
