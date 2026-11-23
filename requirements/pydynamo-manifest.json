@@ -4244,17 +4244,17 @@
 },
 "version": "1.7.0"
 },
-"pydyn": {
+"pydynamo": {
 "files": {
-"__editable__.pydyn-0.3.0.pth": "30459a8a56f4fc8783b8d2a2bdd391b78abd664aae5e10951d69b77e0e0641b1",
-"pydyn-0.3.0.dist-info/METADATA": "d4e0fe96eda5dfd32a22ecd02e2487f4d78a280f699113be11c37bfd1e0058fc",
-"pydyn-0.3.0.dist-info/WHEEL": "98e75747d0b7c0c568bfb71263c3d8f970b3a374a6996087bc642be5cb09a1aa",
-"pydyn-0.3.0.dist-info/entry_points.txt": "406985a1b89021a243c40a914c30a719642eeea07cc0c38389b07405837598a1",
-"pydyn-0.3.0.dist-info/licenses/LICENSE": "c22051cd79fc4cf3a948bc4fc4bcf7282959a815b71db9ed4b0dc3daa1707747",
-"pydyn-0.3.0.dist-info/licenses/NOTICE": "b62f54f0d53a2e4f99df3367811ca8c233768bf2fd414204506ea18f25cae19c",
-"pydyn-0.3.0.dist-info/top_level.txt": "4b6b5a37027207631bf4641bee8254aad1eb311f2d220a6af3a505c490701df8"
+"__editable__.pydynamo-0.4.0.pth": "a9613e5bd2c038ec9456d7935e35160394032062972cd7e53aea2044e5f5ac32",
+"pydynamo-0.4.0.dist-info/METADATA": "4c9a8197fedc5b3c2cd5d7d621937f4e5b32024100b598c17aed8a2499b7d208",
+"pydynamo-0.4.0.dist-info/WHEEL": "98e75747d0b7c0c568bfb71263c3d8f970b3a374a6996087bc642be5cb09a1aa",
+"pydynamo-0.4.0.dist-info/entry_points.txt": "42303b634a2459e6f2b2a13fd12c7471bcbbbb68b8a302e9fe87367686c103e9",
+"pydynamo-0.4.0.dist-info/licenses/LICENSE": "c22051cd79fc4cf3a948bc4fc4bcf7282959a815b71db9ed4b0dc3daa1707747",
+"pydynamo-0.4.0.dist-info/licenses/NOTICE": "f3c8cfbfa50f4f680b536ffcb8e608625500ead73667369036afe82febc3f44a",
+"pydynamo-0.4.0.dist-info/top_level.txt": "8788f4d8e6c9739ec13322e8781df4f0a9c618e4b3209a9b2dd177f5613c9563"
 },
-"version": "0.3.0"
+"version": "0.4.0"
 },
 "pygments": {
 "files": {

@@ -19,7 +19,7 @@ external/*
 *.mrcs
 *.rec
 *.btbl
-*.btbl.pydyn
+*.btbl.pydynamo
 *.tbl
 *.npy
 *.npz

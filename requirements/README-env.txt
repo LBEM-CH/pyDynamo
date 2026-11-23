@@ -8,7 +8,7 @@ What it is
     i.e. the baseline x86-64 build, not the x86_64_v3 one), downloaded by uv.
   * Packages: wheels from PyPI only, with exact versions and sha256 hashes in requirements/pydynamo-lock.txt. pyDynamo's
     bit-identical Dynamo parity was verified with exactly these versions.
-  * pydyn itself is installed editable (pip install -e), so edits under prototype/pydyn take effect at once.
+  * pydynamo itself is installed editable (pip install -e), so edits under src/pydynamo take effect at once.
   * requirements/recreate.sh builds it; requirements/verify_env.py checks it (see below).
 
 Everything lives under .envs/ of the repository (nothing in $HOME; .envs/ is in .gitignore):
@@ -24,14 +24,14 @@ Use it
       dynamo_execute_project, dtrandomize_azimuth, daverage, dmapview and dview come from the env
   deactivate
       leaves it (restores PATH and the prompt)
-  <repository>/prototype/bin/pydynamo-shell
+  <repository>/bin/pydynamo-shell
       instead of activating in the login shell: a new interactive shell with this env active and a minimal
       environment (HOME, USER, the terminal, the X display, PATH /usr/bin:/bin plus the directory of sbatch);
       exit leaves it
 
 Without activating: <repository>/.envs/pydynamo/bin/python -I ...
-The console scripts restart themselves once in a clean environment (pydyn.cli._clean_reexec; the viewers through
-pydyn.viewers.__main__._clean_reexec): without PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, PYTHONUSERBASE, LD_LIBRARY_PATH
+The console scripts restart themselves once in a clean environment (pydynamo.cli._clean_reexec; the viewers through
+pydynamo.viewers.__main__._clean_reexec): without PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, PYTHONUSERBASE, LD_LIBRARY_PATH
 and LD_PRELOAD (dmapview and dview also without QT_PLUGIN_PATH, QT_QPA_PLATFORM_PLUGIN_PATH, QML2_IMPORT_PATH and
 QML_IMPORT_PATH), so settings of the login shell (a module system such as an SBGrid-style software tree, conda, another
 Python) do not leak in.
@@ -63,9 +63,9 @@ binary at .envs/tools/bin/uv (step 0). Steps 1 to 4 are what it runs; P is the r
   $UV venv --relocatable --prompt pydynamo --python cpython-3.11.18-linux-x86_64-gnu $P/.envs/pydynamo
   # 3. exactly the locked packages, hash-checked (sync also removes anything not in the lock)
   $UV pip sync --python $P/.envs/pydynamo/bin/python --require-hashes $P/requirements/pydynamo-lock.txt
-  # 4. pydyn, editable, without touching the pinned packages
+  # 4. pydynamo, editable, without touching the pinned packages
   $P/.envs/pydynamo/bin/python -I -m pip install --no-deps --no-cache-dir -e $P
-  #    (setuptools writes prototype/pydyn.egg-info while doing this; recreate.sh deletes it, it is in .gitignore)
+  #    (setuptools writes src/pydynamo.egg-info while doing this; recreate.sh deletes it, it is in .gitignore)
 
 The current env was made with uv 0.13.7 (pyvenv.cfg records the version).
 
@@ -76,7 +76,7 @@ Check it
       requirements/pydynamo-gui-manifest.json $P/.envs/pydynamo/lib/python3.11/site-packages
       ->  verify_env: OK (18 distributions, 9878 files)
 verify_env.py compares the sha256 of every installed file with the manifests and reports any other distribution
-(pydyn's own editable metadata may differ).
+(pydynamo's own editable metadata may differ).
 
 Rules
 -----
@@ -86,12 +86,12 @@ Rules
   * CUDA: CuPy uses the node's NVIDIA driver (libcuda) plus the CUDA 12.4 wheels of the lock: cuFFT 11.2.1.3,
     cuBLAS/cuBLASLt 12.4.5.8, NVRTC 12.4.127, and the CUDA 12.4.127 headers of nvidia-cuda-runtime-cu12 (NVRTC
     compiles). CuPy 14.2.0 links the CUDA 12.9 runtime statically, so cupy.cuda.runtime.runtimeGetVersion() reports
-    12090; the pydyn workloads load no libcudart.so. curand and nvJitLink are not loaded by pydyn and are not
-    installed; if pydyn ever needs them, add nvidia-curand-cu12==10.3.5.147 / nvidia-nvjitlink-cu12==12.4.127 to the
+    12090; the pydynamo workloads load no libcudart.so. curand and nvJitLink are not loaded by pydynamo and are not
+    installed; if pydynamo ever needs them, add nvidia-curand-cu12==10.3.5.147 / nvidia-nvjitlink-cu12==12.4.127 to the
     lock, otherwise CuPy would fall back to a system CUDA installation (e.g. /usr/local/cuda).
   * Not in the lock: the default exact engine also loads Dynamo 1.1.514's own kernels from the local Dynamo
-    installation ($PYDYN_DYNAMO_ROOT) and the CUDA 8 libraries libcufft.so.8.0 and libcublas.so.8.0
-    ($PYDYN_CUDA8_LIB); bit-identical averages need FFTW 3 ($PYDYN_FFTW_LIB if set, else the system's
+    installation ($PYDYNAMO_DYNAMO_ROOT) and the CUDA 8 libraries libcufft.so.8.0 and libcublas.so.8.0
+    ($PYDYNAMO_CUDA8_LIB); bit-identical averages need FFTW 3 ($PYDYNAMO_FFTW_LIB if set, else the system's
     libfftw3.so.3). See the Requirements section of README.md.
 
 Moving the env
@@ -99,7 +99,7 @@ Moving the env
 The env is made with --relocatable: python, pip, pytest, the activate scripts and every script installed by uv find
 the env from their own location. Only the files that 'pip install -e' writes hold absolute paths: the console
 scripts in bin/ (pydynamo, dcp, dynamo_execute_project, dtrandomize_azimuth, daverage, dmapview, dview; their first
-line names the env's python) and pydyn's editable-install .pth file and direct_url.json in site-packages (they name
+line names the env's python) and pydynamo's editable-install .pth file and direct_url.json in site-packages (they name
 the repository). After moving the env, run step 4 again in the new place (it rewrites them). bin/python is an
 absolute symlink into .envs/uv-python, and pyvenv.cfg names the same folder, so after moving the whole repository,
 re-create the env with recreate.sh.
@@ -108,9 +108,9 @@ GUI section (Qt)
 ----------------
 The lock ends with a separate GUI section: pyside6-essentials==6.11.3, pyside6-addons==6.11.3 and shiboken6==6.11.3
 (Qt for Python, LGPLv3). PySide6-Essentials holds QtCore, QtGui, QtWidgets and the xcb/offscreen platform plugins;
-PySide6-Addons holds Qt WebEngine, which shows the dcp window; shiboken6 is their binding runtime. Only pydyn.viewers
+PySide6-Addons holds Qt WebEngine, which shows the dcp window; shiboken6 is their binding runtime. Only pydynamo.viewers
 (dmapview, dview, dslices, dtplot, the masks-window overlay, the adaptive-filtering FSC plot; each viewer runs in its
-own process) and the dcp window (pydyn.webui.shell) import them; no numerical code does.
+own process) and the dcp window (pydynamo.webui.shell) import them; no numerical code does.
   * Recreate: recreate.sh installs them together with the rest (uv pip sync of the whole lock).
   * Add them to an existing env without touching anything else:
       sed -n '/^# GUI section/,$p' requirements/pydynamo-lock.txt | grep -v '^#' > gui.txt
@@ -123,4 +123,4 @@ own process) and the dcp window (pydyn.webui.shell) import them; no numerical co
     package manager if they are missing. Headless tests use QT_QPA_PLATFORM=offscreen.
   * A login environment that adds its own Qt 6 libraries to LD_LIBRARY_PATH overrides PySide6's RUNPATH and can break
     the import (for example an undefined symbol in libQt6DBus). This is why the console scripts drop LD_LIBRARY_PATH
-    and pydyn.viewers starts each viewer without it and without the Qt plugin path variables.
+    and pydynamo.viewers starts each viewer without it and without the Qt plugin path variables.

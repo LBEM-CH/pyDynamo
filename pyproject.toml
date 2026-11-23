@@ -3,10 +3,10 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pydyn"
-version = "0.3.0"
+name = "pydynamo"
+version = "0.4.0"
 description = "Dynamo 1.1.514 subtomogram averaging (dcp projects, console functions, GPU alignment/averaging) in Python, without MATLAB"
-readme = "prototype/README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = ["numpy>=1.26", "scipy>=1.11"]
@@ -14,27 +14,26 @@ dependencies = ["numpy>=1.26", "scipy>=1.11"]
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
 test = ["pytest>=8"]
-# the Qt viewers (dmapview, dview, dslices, dtplot) and the dcp window (pydyn.webui: Qt WebEngine)
+# the Qt viewers (dmapview, dview, dslices, dtplot) and the dcp window (pydynamo.webui: Qt WebEngine)
 gui = ["PySide6-Essentials==6.11.3", "PySide6-Addons==6.11.3"]
 
 [project.scripts]
-# both restart themselves once in a clean environment (pydyn.cli._clean_reexec)
-pydynamo = "pydyn.cli:main"
-dcp = "pydyn.cli:dcp_main"
+# both restart themselves once in a clean environment (pydynamo.cli._clean_reexec)
+pydynamo = "pydynamo.cli:main"
+dcp = "pydynamo.cli:dcp_main"
 # Dynamo's command name: with this environment active, the byte-identical <name>.exe
 # (`dynamo_execute_project <name>`) runs pyDynamo; without it, Dynamo
-dynamo_execute_project = "pydyn.cli:execute_main"
+dynamo_execute_project = "pydynamo.cli:execute_main"
 # Dynamo console steps as shell commands: dtrandomize_azimuth --i in.tbl --o out.tbl; daverage --d DATA --t TABLE --o avg.em
-dtrandomize_azimuth = "pydyn.cli:dtrandomize_azimuth_main"
-daverage = "pydyn.cli:daverage_main"
-dmapview = "pydyn.viewers.__main__:dmapview_main"
-dview = "pydyn.viewers.__main__:dview_main"
+dtrandomize_azimuth = "pydynamo.cli:dtrandomize_azimuth_main"
+daverage = "pydynamo.cli:daverage_main"
+dmapview = "pydynamo.viewers.__main__:dmapview_main"
+dview = "pydynamo.viewers.__main__:dview_main"
 
-[tool.setuptools]
-package-dir = { "" = "prototype" }
-packages = ["pydyn", "pydyn.viewers", "pydyn.webui"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
 # the HTML view and its vendored libraries (Bootstrap 5.3.3, Bootstrap Icons 1.11.3; MIT, see static/vendor)
-"pydyn.webui" = ["static/*.html", "static/*.css", "static/*.js", "static/vendor/MANIFEST.txt",
+"pydynamo.webui" = ["static/*.html", "static/*.css", "static/*.js", "static/vendor/MANIFEST.txt",
                  "static/vendor/*/*", "static/vendor/*/*/*"]

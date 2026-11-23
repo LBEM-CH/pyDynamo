@@ -3,7 +3,7 @@
 # pyDynamo's bit-identical Dynamo parity was verified with exactly these versions; change one only after re-checking it.
 # requirements/verify_env.py checks every installed file against pydynamo-manifest.json and pydynamo-gui-manifest.json.
 # Install ONLY with:  uv pip sync --require-hashes --python .envs/pydynamo/bin/python requirements/pydynamo-lock.txt
-# then pydyn editable: .envs/pydynamo/bin/python -I -m pip install --no-deps -e .
+# then pydynamo editable: .envs/pydynamo/bin/python -I -m pip install --no-deps -e .
 #
 # Pins (regenerate with uv pip compile --generate-hashes --no-annotate --no-header from exactly these lines):
 #   runtime            numpy==2.4.6  scipy==1.17.1  cupy-cuda12x==14.2.0  cuda-pathfinder==1.8.6 (CuPy's library finder)
@@ -14,9 +14,9 @@
 #     nvidia-cuda-nvrtc-cu12==12.4.127  libnvrtc.so.12, libnvrtc-builtins.so.12.4 (RawKernel / elementwise compiles)
 #     nvidia-cuda-runtime-cu12==12.4.127  CUDA headers for NVRTC (cuda.pathfinder header dir); its libcudart.so.12 is
 #                                       not loaded: CuPy 14.2.0 links the CUDA 12.9 runtime statically (runtime 12090)
-#   not included (not loaded by pydyn; add the same versions if a later pydyn needs them): nvidia-curand-cu12==10.3.5.147,
+#   not included (not loaded by pydynamo; add the same versions if a later pydynamo needs them): nvidia-curand-cu12==10.3.5.147,
 #     nvidia-nvjitlink-cu12==12.4.127, nvidia-cusolver/cusparse/cudnn/nccl/...; torch, triton, pandas, starfile, mrcfile,
-#     sympy and other general-purpose packages (nothing in pydyn or its tests imports them)
+#     sympy and other general-purpose packages (nothing in pydynamo or its tests imports them)
 #   tests              pytest==9.2.0  iniconfig==2.3.1  packaging==26.3  pluggy==1.7.0  pygments==2.21.0
 #   installer          pip==26.2.2 (for pip install -e)
 --index-url https://pypi.org/simple
@@ -214,11 +214,11 @@ scipy==1.17.1 \
 
 
 # ==================================================================================================================
-# GUI section: the Qt viewers of pydyn.viewers (dmapview, dview, dslices
-# overlays) and the dcp window of pydyn.webui. No numerical code path imports these; the 14 numerical/test packages
+# GUI section: the Qt viewers of pydynamo.viewers (dmapview, dview, dslices
+# overlays) and the dcp window of pydynamo.webui. No numerical code path imports these; the 14 numerical/test packages
 # above are unchanged (verify_env.py).
 #   pyside6-addons==6.11.3       Qt for Python add-on modules (same licence): QtWebEngine (Chromium), which shows the
-#                                HTML dcp window (pydyn.webui.shell); the other add-on modules are not used.
+#                                HTML dcp window (pydynamo.webui.shell); the other add-on modules are not used.
 #   pyside6-essentials==6.11.3   Qt for Python 6.11.3 (LGPLv3 / GPLv3 / commercial; used under the LGPL): QtCore, QtGui,
 #                                QtWidgets and the xcb/offscreen platform plugins. The PySide6 meta package is not
 #                                installed.

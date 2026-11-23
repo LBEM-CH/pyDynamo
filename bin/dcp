@@ -1,0 +1,12 @@
+#!/bin/bash
+# pydynamo `dcp`: the dcp window, Dynamo 1.1.514's project manager (pydynamo.webui; dcp --help).
+# Usage: dcp [NAME [-option value ...]]
+# Same as the console script .envs/pydynamo/bin/dcp (pydynamo.cli.dcp_main), but it does not need 'pip install -e': the
+# repository's src folder is put on sys.path. It starts the env's python with -I and without PYTHONPATH,
+# PYTHONHOME, PYTHONSTARTUP, PYTHONUSERBASE, LD_LIBRARY_PATH and LD_PRELOAD, so settings of the login shell (a module
+# system, conda, another Qt 6 or CUDA) cannot leak in. DISPLAY is kept.
+HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"      # the repository
+PY="$HERE/.envs/pydynamo/bin/python"
+exec env -u PYTHONPATH -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONUSERBASE -u LD_LIBRARY_PATH -u LD_PRELOAD \
+  PYTHONNOUSERSITE=1 PIP_CONFIG_FILE=/dev/null "$PY" -I -c \
+  "import sys; sys.path.insert(0, '$HERE/src'); from pydynamo.cli import dcp_main; sys.exit(dcp_main())" "$@"

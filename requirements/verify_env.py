@@ -2,7 +2,7 @@
 
     python -I -B verify_env.py MANIFEST.json [MORE_MANIFEST.json ...] SITE_PACKAGES_DIR
 MANIFEST.json is record_compare.py's output for the tested env (pydynamo-uv). Exit status 0 when every listed file
-exists with the same sha256 and no other distribution (except pydyn) is installed. Several manifests are merged:
+exists with the same sha256 and no other distribution (except pydynamo) is installed. Several manifests are merged:
 pydynamo-manifest.json (the numerical packages) plus pydynamo-gui-manifest.json (the GUI section of the lock).
 """
 import glob
@@ -23,7 +23,7 @@ for name, d in sorted(man.items()):
             print("MISSING", name, f)
             bad += 1
         elif hashlib.sha256(open(p, "rb").read()).hexdigest() != h:
-            if name == "pydyn":
+            if name == "pydynamo":
                 continue                     # editable metadata (README text) may change with the source
             print("DIFFERS", name, f)
             bad += 1

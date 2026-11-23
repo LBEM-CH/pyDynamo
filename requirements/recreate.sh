@@ -14,9 +14,9 @@ $UV python install --no-bin cpython-3.11.18-linux-x86_64-gnu
 test ! -e $T     # refuses to overwrite: move the old env away first
 $UV venv --relocatable --prompt pydynamo --python cpython-3.11.18-linux-x86_64-gnu $T
 $UV pip sync --python $T/bin/python --require-hashes $P/requirements/pydynamo-lock.txt
-test ! -e $P/prototype/pydyn.egg-info
+test ! -e $P/src/pydynamo.egg-info
 $T/bin/python -I -m pip install --no-deps --no-cache-dir -e $P
-rm -rf $P/prototype/pydyn.egg-info
+rm -rf $P/src/pydynamo.egg-info
 grep home $T/pyvenv.cfg
 ls -la $T/lib/python3.11/site-packages/nvidia/
 date -Iseconds
