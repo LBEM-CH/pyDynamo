@@ -306,6 +306,57 @@ def test_fmask_use_ones_multireference(tmp_path, monkeypatch):
         assert f.shape == (64, 64, 64) and np.all(f == 1)
 
 
+def test_template_enter_seed_folder_multireference(tmp_path, monkeypatch, capsys):
+    """dcp.templateEnter on a 2-reference project (S/@dcp/templateEnter.m:23-46): the seed folder is accepted and the
+    size of its first seed is stored (dcp.availableSeeds 'getSizes'); seeds of different sizes give Dynamo's error
+    and the report, and the stored size stays. The mask checks read the current seeds each time
+    (dProject.getTemplateSize, @file_mask/checkValue.m:26)."""
+    monkeypatch.chdir(tmp_path)
+    make_data(str(tmp_path), N=4)
+    from pydyn.dcptool import dcp
+    dcp.new("p1", "d", "filamentsData_ctf", "template", "raw_template_ctf.em", "masks", "default", "t",
+            "particles_edit_mod.tbl", "gui", 0)
+    c = DcpController()
+    c.open("p1")
+    assert c.golden_standard_derive() == "p1_eo" and c.enter_project_name("p1_eo") == "opened"
+    seeds = c.runtime["file_template_initial"]
+    assert seeds == "./p1_eo/settings" and c.template_size_cache == [64, 64, 64]
+    assert c.template_enter(seeds).ok and c.template_size_cache == [64, 64, 64]       # a folder: no dread of it
+    assert c.correct["template"] and c.enabled["masks"]
+    for r in (1, 2):                                                 # new seeds with another box
+        dynio.write_em("seeds32/template_initial_ref_%03d.em" % r, np.ones((32, 32, 32), np.float32))
+    assert c.template_enter("seeds32").ok and c.template_size_cache == [32, 32, 32]
+    assert V.load("p1_eo")["file_template_initial"] == "seeds32"
+    mask = c.check_value("file_mask", c.runtime["file_mask"])       # the 64^3 mask against the current seeds
+    assert not mask.ok and "does not correspondo to size of template  32 32 32" in mask.report[0]
+    dynio.write_em("mixed/template_initial_ref_001.em", np.ones((32, 32, 32), np.float32))
+    dynio.write_em("mixed/template_initial_ref_002.em", np.ones((40, 40, 40), np.float32))
+    capsys.readouterr()
+    assert c.template_enter("mixed").ok                             # enterFileParameter's o.ok is returned
+    assert c.template_size_cache == [32, 32, 32]                    # Dynamo returns before assigning a size
+    assert c.messages[-2:] == [("Error: something went wrong when entering template. Aborting.", "r"),
+                               ("Not all templates have the same dimensionality.", "r")]
+    assert "Not all templates have the same dimensionality." in capsys.readouterr().out   # o.echo: on the screen
+    assert c.check_value("file_mask", c.runtime["file_mask"]).ok    # no template size: the size is not checked
+
+
+def test_set_destination_warns_unless_pydyn_runs_it(tmp_path, monkeypatch):
+    """pydyn runs standalone_gpu projects only (DynamoProject.validate): matlab_gpu is stored as in Dynamo, with the
+    warning that pydyn will not run it."""
+    from pydyn.dcpcontrol import PYDYN_EXECUTES
+    monkeypatch.chdir(tmp_path)
+    make_data(str(tmp_path), N=3)
+    c = DcpController()
+    c.new("p1", d="filamentsData_ctf", template="raw_template_ctf.em", t="particles_edit_mod.tbl")
+    assert PYDYN_EXECUTES == ("standalone_gpu",)
+    n = len(c.messages)
+    assert c.set_destination("matlab_gpu").ok and V.load("p1")["destination"] == "matlab_gpu"
+    assert c.messages[n:] == [('[pydyn] destination "matlab_gpu" is stored as in Dynamo, but pydyn executes only '
+                               'standalone_gpu projects', "warning")]
+    n = len(c.messages)
+    assert c.set_destination("standalone_gpu").ok and c.messages[n:] == []
+
+
 def test_data_size_is_read_from_the_particles(tmp_path, monkeypatch):
     """The data window reads the box size from a particle's EM header (dynamo_info_data.m), nothing defaults to 64:
     40^3 particles give l = 40, and dcp.dataEnter sets dim_r1 = 40, low_r1 = round(40/3) = 13."""
@@ -319,3 +370,14 @@ def test_data_size_is_read_from_the_particles(tmp_path, monkeypatch):
     assert (c.data_facts["N"], c.data_facts["l"], c.data_facts["size"]) == (3, 40, [40, 40, 40])
     v = V.load("p40")
     assert (v["dim_r1"], v["low_r1"], v["ite_r1"]) == (40.0, 13.0, 1.0)
+
+
+def test_str2num_zero_step_range_is_empty():
+    """MATLAB a:0:b is empty (1x0), so str2num('01:00:00') = 1:0:0 = [] and dvput keeps a walltime as text, as
+    Dynamo's str2num_ifnum does; '00:30:00' = 0:30:0 = [0] is numeric in both."""
+    assert str2num("01:00:00").size == 0 and str2num("1:0:5").size == 0
+    assert str2num("[1 2:0:3 4]").tolist() == [1.0, 4.0]
+    assert V._str2num_ifnum("01:00:00") == "01:00:00"
+    assert V._str2num_ifnum("00:30:00") == 0.0
+    with pytest.raises(NotImplementedError):
+        str2num("1:0.5:3")

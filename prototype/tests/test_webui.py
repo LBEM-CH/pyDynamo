@@ -90,6 +90,14 @@ def server():
     srv.server_close()
 
 
+@pytest.fixture(autouse=True)
+def _pydyn_cache(tmp_path_factory, monkeypatch):
+    """pydyn's per-user cache (the mask editor's logs) in a folder of the test, apart from its working folder."""
+    d = tmp_path_factory.mktemp("pydyn_cache")
+    monkeypatch.setenv("PYDYN_CACHE_DIR", str(d))
+    return d
+
+
 def test_api_journey_matches_dynamo_run_g(tmp_path, monkeypatch, server):
     """test_dcpgui.test_gui_journey_matches_dynamo_run_g with every call made through the HTML view's API."""
     c, out = _journey(tmp_path, monkeypatch, make=lambda: ApiController(server))
@@ -206,6 +214,11 @@ def test_dcp_shell_one_line_start(tmp_path, monkeypatch, capsys):
     assert main(["--d", "filamentsData_ctf"]) == 2                               # no project name
     assert main(["--p", "missing"]) == 1 and "Project NOT in disk" in capsys.readouterr().out
     assert main(["--p", "a", "b"]) == 2                                          # two names
+    import pydyn.webui as webui
+    monkeypatch.setattr(webui, "run", lambda *a, **kw: pytest.fail("the window was opened"))
+    assert main(["--p", "p2", "--no-gui"]) == 2                                  # nothing to create: no window
+    assert "applies only when creating" in capsys.readouterr().out
+    assert main(["--no-gui"]) == 2 and main(["p2", "-gui", "0"]) == 2
 
 
 def test_pydynamo_console(tmp_path):
@@ -230,14 +243,21 @@ def test_html_view_runs_in_qt_webengine(tmp_path):
     make_data(str(tmp_path), N=4)
     js = ("(async () => { for (const s of ['data','table','template','masks','settings','destination','check',"
           "'unfold','run']) { const el = document.querySelector('[data-step='+s+']'); if (el) { el.click(); "
-          "await new Promise(r => setTimeout(r, 350)); } } document.querySelector('[data-step=check]').click(); "
+          "await new Promise(r => setTimeout(r, 350)); } } "
+          # the Computing environment's Submit to Slurm switch (the page again until it shows it: a step clicked
+          # while another call holds the session renders without it), then the Run page in Slurm mode
+          "let sw = null; for (let k = 0; k < 8 && !sw; k++) { document.querySelector('[data-step=destination]').click(); "
+          "await new Promise(r => setTimeout(r, 700)); sw = document.querySelector('#runSlurm'); } "
+          "if (sw) { sw.click(); await new Promise(r => setTimeout(r, 1200)); } "
+          "document.querySelector('[data-step=run]').click(); await new Promise(r => setTimeout(r, 1200)); "
+          "document.querySelector('[data-step=check]').click(); "
           "await new Promise(r => setTimeout(r, 300)); document.querySelector('[data-act=check]').click(); })()")
     code = ("import sys; sys.path[:0] = [%r, %r]\n"
             "from pydyn.dcptool import dcp\n"
             "dcp.new('p1', 'd', 'filamentsData_ctf', 'template', 'raw_template_ctf.em', 'masks', 'default', 't', "
             "'particles_edit_mod.tbl', 'gui', 0)\n"
             "from pydyn.webui.server import serve\nfrom pydyn.webui.shell import run_window\n"
-            "srv = serve('p1')\nrun_window(srv, snap='view.png', script=%r, settle_ms=8000)\n"
+            "srv = serve('p1')\nrun_window(srv, snap='view.png', script=%r, settle_ms=16000)\n"
             "print('MESSAGES', [m['text'] for m in srv.session.messages()])\n"
             % (os.path.join(P, "prototype"), HERE, js))
     env = {k: v for k, v in os.environ.items() if k not in ("LD_LIBRARY_PATH", "PYTHONPATH")}
@@ -249,6 +269,8 @@ def test_html_view_runs_in_qt_webengine(tmp_path):
     errors = [ln for ln in r.stderr.splitlines() if ln.startswith("[dcp view]")]
     assert errors == [], errors
     assert "Checking project consistency" in r.stdout
+    msgs = r.stdout.split("MESSAGES", 1)[-1]
+    assert '"submit to Slurm"  in disk  set to "1"' in msgs, msgs[-1500:]   # the switch saved into the project
 
 
 def test_mask_inspector_tiles_are_dynamo_mapview_tiles(tmp_path, monkeypatch, server):
@@ -302,11 +324,13 @@ def test_file_chooser_lists_every_entry_fast(tmp_path):
     assert small["dirs"] == ["particles"] and small["files"] == [] and small["sizes"] == []
 
 
-def test_mask_editor_keeps_its_mask_and_settings(tmp_path, monkeypatch):
-    """Create mask writes (and overwrites) a log next to the mask, <mask>.log, with the settings that made it.
+def test_mask_editor_keeps_its_mask_and_settings(tmp_path, monkeypatch, _pydyn_cache):
+    """Create mask writes (and overwrites) a log with the settings that made the mask, in pydyn's per-user cache:
+    the project folder gets the mask only, as with Dynamo's mask editor (dynamo_mask_GUI.m:385).
     Reopening the editor brings back this session's settings, or in a new session the settings of the log; Load of a
-    mask with a log fills in its settings; a mask changed after its log keeps the settings with a warning; a mask
-    without a log is shown as it is. The page knows the editor's mask for its 'from editor' buttons."""
+    mask with a log (also one carried next to it, <mask>.log) fills in its settings; a mask changed after its log keeps
+    the settings with a warning; a mask without a log is shown as it is. The page knows the editor's mask for its
+    'from editor' buttons."""
     import shutil
     import numpy as np
     from pydyn import dynio
@@ -318,7 +342,9 @@ def test_mask_editor_keeps_its_mask_and_settings(tmp_path, monkeypatch):
             "particles_edit_mod.tbl", "gui", 0)
     cyl = {"size": "64  64  64", "type": "cylinder", "invert": False, "save_file": "p1/settings/editorMask.em",
            "radio": {"r": True, "height": True, "gaussian": True}, "edit": {"r": "15", "height": "50", "gaussian": "3"}}
-    log = "p1/settings/editorMask.em.log"
+    log = mask_log_path("p1/settings/editorMask.em")
+    assert os.path.dirname(log) == os.path.join(str(_pydyn_cache), "mask_logs")       # outside the project
+    settings_before = sorted(os.listdir("p1/settings"))
     srv = serve()
     try:
         c = ApiController(srv)
@@ -331,6 +357,7 @@ def test_mask_editor_keeps_its_mask_and_settings(tmp_path, monkeypatch):
         assert e["source"] == "session" and (e["type"], e["edit"]["r"], e["edit"]["height"]) == ("cylinder", "15", "50")
         e = c.editor_save(cyl)                                       # Create mask: the mask and its log
         assert e["exists"] and e["log"] == log and mask_log_path(cyl["save_file"]) == log
+        assert sorted(os.listdir("p1/settings")) == sorted(settings_before + ["editorMask.em"])   # the mask only
         text = open(log).read()
         assert "type = cylinder" in text and "r = 15" in text and "height = 50" in text and "gaussian = 3" in text
         assert "sx =" not in text                                    # only the ticked settings
@@ -350,10 +377,11 @@ def test_mask_editor_keeps_its_mask_and_settings(tmp_path, monkeypatch):
         e = c.editor_open("align")
         assert e["source"] == "log" and e["exists"] and e["type"] == "cylinder" and e["log_matches"] is True
         assert (e["edit"]["r"], e["edit"]["height"], e["edit"]["gaussian"], e["radio"]["r"]) == ("15", "50", "3", True)
-        shutil.copy("p1/settings/editorMask.em", "copied_mask.em")    # a mask carried with its log
+        shutil.copy("p1/settings/editorMask.em", "copied_mask.em")    # a mask carried with its log next to it
         shutil.copy(log, "copied_mask.em.log")
         e = c.editor_load("copied_mask.em")
         assert e["source"] == "log" and e["edit"]["height"] == "50" and e["log_matches"] is True
+        assert e["log"] == "copied_mask.em.log"                      # read there, never written there
         other = np.zeros((64, 64, 64), np.float32)
         other[20:44, 20:44, 20:44] = 1
         dynio.write_em("foreign_mask.em", other)                     # no log: shown as it is
@@ -376,6 +404,7 @@ def test_mask_editor_keeps_its_mask_and_settings(tmp_path, monkeypatch):
         assert e["source"] == "log" and e["log_matches"] is False
     finally:
         srv.shutdown(); srv.server_close()
+    assert not [f for _, _, fs in os.walk("p1") for f in fs if f.endswith((".log", ".tmp"))]   # nothing of pydyn's
 
 
 def test_window_runs_projects_on_gpus(tmp_path, monkeypatch, server):

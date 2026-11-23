@@ -3,6 +3,7 @@ import math
 import os
 
 import numpy as np
+import pytest
 
 from pydyn.average import finalize, fsc_fouriermask, fweight_divide, halves_for, normalize_roi, wedge_mask
 from pydyn.engine import bandpass_half, folded_indices_half, subpixel_spline, wedge_half
@@ -162,3 +163,105 @@ def test_fdlibm_trig_equals_matlab_runtime_values():
     assert all(F.acos(h(x)).hex() == y for x, y in fx["acos"])
     assert all(F.pow(h(x), h(y)).hex() == z for x, y, z in fx["pow"])           # MATLAB scalar ^ (e_pow.c)
     assert math.copysign(1.0, F.sin(-0.0)) == -1.0 and F.acos(1.0) == 0.0 and F.atan2(0.0, -1.0) == math.pi
+
+
+def test_fdlibm_rem_pio2_quick_check_of_e_rem_pio2():
+    """e_rem_pio2.c, medium size: one round with 33+53 bits of pi/2 when n < 32 and the high word of |x| is not
+    npio2_hw[n-1] (the high word of n*pi/2), whatever the exponent loss; the 2nd/3rd iterations otherwise."""
+    from fractions import Fraction
+    from pydyn import fdlibm as F
+    pi = Fraction("3.14159265358979323846264338327950288419716939937510582097494459")
+    assert [F._hi(float(pi * (k + 1) / 2)) for k in range(32)] == list(F._NPIO2_HW)
+    x = math.pi * (1 + 2.0 ** -17)                                 # about 180.0014 degrees
+    n = int(x * F._INVPIO2 + 0.5)
+    r = x - float(n) * F._PIO2_1
+    w = float(n) * F._PIO2_1T
+    y0 = r - w
+    ix = F._hi(x) & 0x7fffffff
+    # the case: not n*pi/2's high word, yet an exponent loss > 16 (where the 2nd iteration would start)
+    assert n == 2 and ix != F._NPIO2_HW[1] and (ix >> 20) - ((F._hi(y0) >> 20) & 0x7ff) > 16
+    assert F._rem_pio2(x) == (2, y0, (r - y0) - w)
+    assert F._rem_pio2(-x) == (-2, -y0, -((r - y0) - w))
+    # high word of pi itself (npio2_hw[1]): iterated to 151 bits, sin(pi) = pi - fl(pi) rounded
+    assert F.sin(math.pi) == 1.2246467991473532e-16 and F.cos(math.pi) == -1.0
+
+
+# ------------------------------------------------------------------------------------------------ masks
+def test_matlab_exp_takes_e_exp_overflow_underflow_branch():
+    """fdlibm e_exp.c for |x| >= 709.78: NaN -> x+x, exp(+-inf) = {inf, 0}, inf above o_threshold, 0 below
+    u_threshold, and the normal reduction in between (subnormal results, one rounding as e_exp.c's
+    (y*2^(k+1000))*2^-1000); dynamo_blob reaches it for a small 'gaussian' in a large box."""
+    from pydyn.masks import dynamo_blob, matlab_exp
+    sp = matlab_exp(np.array([np.nan, np.inf, -np.inf, 709.79, 1e308, -745.2, -1e308]))
+    assert np.isnan(sp[0]) and sp[1] == np.inf and sp[2] == 0.0 and sp[3] == np.inf and sp[4] == np.inf
+    assert sp[5] == 0.0 and sp[6] == 0.0
+    x = np.concatenate([np.linspace(-745.13, -709.79, 2001), [-720.0, -745.0]])
+    got = matlab_exp(x)
+    want = np.array([math.exp(v) for v in x.tolist()])
+    assert np.all(got > 0) and np.all(got < 2.2250738585072014e-308)             # subnormal, not flushed
+    assert np.all(np.abs(got - want) <= 2.0 ** -1074)                            # within one subnormal step
+    top = matlab_exp(np.array([709.7825]))[0]                                    # >= 709.78, <= o_threshold
+    assert np.isfinite(top) and abs(top - math.exp(709.7825)) <= 2.3e-16 * top
+    b = dynamo_blob(64, 3)                                     # 'gaussian' 1.5 in a 64 box: corner argument -946
+    assert b[32, 32, 32] == 1.0 and b[0, 0, 0] == 0.0 and b.min() >= 0.0
+
+
+def test_dynamo_mask_cylinder_with_a_small_gaussian():
+    """dynamo_mask(..., 'gaussian', g) with g < box/37 (dynamo_blob arguments below -709.78) gives a mask."""
+    from pydyn.masks import dynamo_mask
+    m = dynamo_mask(size=32, type="cylinder", r=8, height=16, gaussian=0.5)
+    assert m.shape == (32, 32, 32) and m.min() == 0.0 and m.max() == 1.0 and np.isfinite(m).all()
+
+
+def test_dynamo_mask_cylinder_ignores_what_dynamo_mask_does_not_read(tmp_path):
+    """dynamo_mask.m for a cylinder (:483-485): smooth, fwhm, tilt, sz, r2, thick, nfig change nothing; r1 stands in
+    for r only when r and sx are empty (:350-360); 'radius' and 'h' override 'r' and 'height' (:262-263); an empty
+    value is not given. What changes a cylinder and is not ported is still refused."""
+    from pydyn.masks import MaskEditor, dynamo_mask
+    base = dynamo_mask(size=16, type="cylinder", r=4, height=8)
+    same = [dict(tilt=[-45, 45]), dict(fwhm=3), dict(sz=2), dict(r2=7), dict(thick=3), dict(smooth=2), dict(nfig=1),
+            dict(band=[]), dict(eulers=np.zeros(0)), dict(position=""), dict(shifts=None), dict(invert=np.zeros(0)),
+            dict(r1=6), dict(r1=[1, 2])]
+    for kw in same:
+        assert np.array_equal(dynamo_mask(size=16, type="cylinder", r=4, height=8, **kw), base), kw
+    for kw in (dict(r1=4), dict(sx=4, r1=6), dict(r=6, radius=4), dict(r=np.zeros(0), radius=4),
+               dict(r=4, height=12, h=8)):
+        kw.setdefault("height", 8)
+        assert np.array_equal(dynamo_mask(size=16, type="cylinder", **kw), base), kw
+    with pytest.raises(ValueError):                            # q.r1+q.thick of unequal lengths (:395)
+        dynamo_mask(size=16, type="cylinder", r=4, height=8, r1=[1, 2], thick=[1, 2, 3])
+    with pytest.raises(ValueError):                            # q.r2-q.r1 of unequal lengths (:405)
+        dynamo_mask(size=16, type="cylinder", r=4, height=8, r1=[1, 2], r2=[1, 2, 3])
+    for kw in (dict(band=[0.1, 0.4]), dict(shifts=[1, 0, 0]), dict(position=[5, 9, 9]), dict(ws="m")):
+        with pytest.raises(NotImplementedError):
+            dynamo_mask(size=16, type="cylinder", r=4, height=8, **kw)
+    # the editor: a radio left on from another type, and ticked radios with empty boxes ([] = not given)
+    ed = MaskEditor(size=[16, 16, 16], mask=str(tmp_path / "m.em"))
+    ed.set_type("cylinder")
+    ed.select("r", "4")
+    ed.select("height", "8")
+    ed.select("tilt", "-60 60")
+    for p in ("fwhm", "eulers", "band", "gaussian"):
+        ed.select(p)
+    assert np.array_equal(ed.save(), base) and ed.messages[-1] == "Mask created and saved"
+
+
+def test_dynamo_mollify_takes_one_or_three_widths(monkeypatch):
+    """dynamo_mollify.m:107 dynamo_blob(size(volume,3), hwhm*2) of the whole 'gaussian' (dynamo_mask.m:565):
+    3 values are a width per axis [x, y, z], 2 values are dynamo_blob's error (dynamo_blob.m:60-62)."""
+    from pydyn import masks
+    v = np.zeros((16, 16, 16))
+    v[8, 8, 8] = 1.0
+    f = masks.dynamo_mollify(v, [1, 2, 3])
+    assert f[8, 8, 9] < f[8, 9, 8] < f[9, 8, 8]                # x (last axis) narrowest, z widest
+    assert np.array_equal(masks.dynamo_mollify(v, [1, 1, 1]), masks.dynamo_mollify(v, 1))
+    with pytest.raises(ValueError, match="one value or three"):
+        masks.dynamo_mollify(v, [1, 2])
+    seen = []
+    blob = masks.dynamo_blob
+    monkeypatch.setattr(masks, "dynamo_blob", lambda l, fw: seen.append(np.ravel(fw).tolist()) or blob(l, fw))
+    masks.dynamo_mask(size=16, type="cylinder", r=4, height=8, gaussian=[1, 2, 3])
+    masks.dynamo_mask(size=16, type="cylinder", r=4, height=8, gaussian="1 2 3")
+    assert seen == [[2.0, 4.0, 6.0], [2.0, 4.0, 6.0]]
+    with pytest.raises(ValueError, match="one value or three"):
+        masks.dynamo_mask(size=16, type="cylinder", r=4, height=8, gaussian=[1, 2])

@@ -45,6 +45,25 @@ def test_engine_recovers_known_shift():
     assert out[0, 9] > 0.95
 
 
+def test_shared_grid_runs_with_the_default_auto_batch():
+    """run_engine.py --engine fast --shared-grid without --batch: align_shared with batch="auto" (it took
+    "auto" // otile) recovers the known shift like the per-particle path."""
+    from pydyn.engine import Engine
+    n = 32
+    t = _blob(n)
+    shift = (2, -1, 3)
+    p = np.roll(t, shift=(shift[2], shift[1], shift[0]), axis=(0, 1, 2))
+    rows = np.zeros((2, 35), dtype=np.float32)
+    rows[:, 0] = [1, 2]
+    eng = Engine(t, default_mask(n), _Card(), batch="auto", exact=False)
+    eng.shared_grid = True
+    eng.prepare_particles(np.stack([p, p]), rows)
+    out = eng.refine(rows)
+    for r in out:
+        assert np.allclose(r[3:6], shift, atol=0.3)
+        assert r[9] > 0.95
+
+
 def test_rotation_kernel_identity_and_gpu_average_matches_cpu_reference():
     import cupy as cp
     from pydyn.average import finalize, halves_for, new_state, ordered_sums

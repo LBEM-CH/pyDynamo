@@ -533,6 +533,14 @@ class FatalIterationError(RuntimeError):
     pass
 
 
+def worker_devices(gpus, gpu_ids_card, how_many_processors=1):
+    """The physical devices that get a GPU worker: `gpus` (default gpu_identifier_set) cut to the number of GPU
+    chunks of a reference, how_many_processors * len(gpu_identifier_set) (setup_gpu, 06a S9.2). compute() deals the
+    chunks over the workers in turn, so a worker beyond that number would get no chunk (as --gpus all, execute.py)."""
+    devs = list(gpus) if gpus else list(gpu_ids_card)
+    return devs[:len(gpu_ids_card) * max(1, int(float(how_many_processors)))]
+
+
 class DynamoProject:
     """A Dynamo 1.1.514 dcp project, re-executed under `out` (the project root).
 
@@ -540,6 +548,7 @@ class DynamoProject:
     data:   the data folder (particle_<tag>.em); its name in the cards stays vpr.folder_data;
     gpus:   physical device ids to run on (default: the vpr's gpu_identifier_set). The GPU chunks and their file
             names always follow the vpr's gpu_identifier_set (06a S9.2); chunk i runs on gpus[i % len(gpus)].
+            Devices beyond the number of chunks of a reference are not used (worker_devices).
     """
 
     def __init__(self, source, data, out, gpus=None, keep_temp=False, table_initial=None,
@@ -574,6 +583,13 @@ class DynamoProject:
         out_dir = self.out
         self.report_path = check_report_path(report or os.environ.get("PYDYN_REPORT"), out_dir)
         self.progress_log = check_report_path(progress_log, out_dir)
+        used = worker_devices(self.gpus, self.gpu_ids_card, self.vpr.get("how_many_processors", 1))
+        if len(used) < len(self.gpus):
+            self.log("GPUs %s requested; the project splits the particles of a reference in %d part%s "
+                     "(gpu_identifier_set): using %s" % (",".join(str(g) for g in self.gpus), len(used),
+                                                         "" if len(used) == 1 else "s",
+                                                         ",".join(str(g) for g in used)))
+        self.gpus = used
         self.gpu_name, self.multiprocessors = "", 0                 # device 0 properties, sent by the workers
         from . import symmetry
         symmetry.set_device(self.gpus[0])                            # main-process symmetry GPU work (M2)
@@ -1051,21 +1067,38 @@ class DynamoProject:
             self.gpu_name, self.multiprocessors = r["gpu_name"], r["multiprocessors"]   # device 0 of the node
 
     def close(self):
-        for _, conn, proc in self.workers:
+        """Stop the GPU workers: an idle worker ends on None. A worker whose reply was not read (another worker
+        failed first in _ask_all) may still be aligning and would keep its GPU and write into temp/ after the run
+        stopped: it is terminated, as is any worker still alive after the join timeout. Every reply that was read
+        came after the worker had written its files, so no result changes."""
+        busy = getattr(self, "_busy", set())
+        for k, (_, conn, proc) in enumerate(self.workers):
+            if k in busy:
+                proc.terminate()
+                continue
             try:
                 conn.send(None)
             except Exception:
                 pass
         for _, _, proc in self.workers:
             proc.join(timeout=60)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
         self.workers = []
+        self._busy = set()
 
     def _ask_all(self, msgs):
-        for (dev, conn, _), m in zip(self.workers, msgs):
+        """One message to every worker, then the replies in worker order. On a failure the workers whose reply is
+        not read stay in self._busy (close() terminates them)."""
+        self._busy = set()
+        for k, ((dev, conn, _), m) in enumerate(zip(self.workers, msgs)):
+            self._busy.add(k)
             conn.send(m)
         out = []
-        for dev, conn, _ in self.workers:
+        for k, (dev, conn, _) in enumerate(self.workers):
             r = conn.recv()
+            self._busy.discard(k)
             if not r.get("ok"):
                 raise RuntimeError("GPU worker on device %d failed:\n%s" % (dev, r.get("error")))
             out.append(r)
@@ -1086,7 +1119,16 @@ class DynamoProject:
             for i, ch in enumerate(ref_chunks):
                 mine[i % len(self.workers)].append(ch)
             t_enter = time.time()
-            r = self._ask_all([{"op": "align", "card": card, "chunks": m, "slot": ref} for m in mine])
+            try:
+                r = self._ask_all([{"op": "align", "card": card, "chunks": m, "slot": ref} for m in mine])
+            except Exception:
+                # the engine run failed (Dynamo: the engine exits != 0, e.g. on a particle file it cannot open):
+                # dynamo_pipeline_system_check_output_gpu.m:40-92 appends its warning block for the order
+                # sprintf('%s %s',myMotor,cardfile) (dynamo_execute_project.m:296-297; getGPUmotor.m:6), and no
+                # engine stdout, gpulog.txt or 'Returning control' line, then error() stops the run
+                self.append_log(dynlog.gpu_failure_lines("dynamo_compute_iteration_spp "
+                                                         + dynlog.card_iteref_path(self.name, ref, ite)))
+                raise
             res += r
             ecard = dynlog.EngineCard(card, self.dstr("cards/ite_%04d/card_iteref_ref_%03d_ite_%04d.card" % (ite, ref, ite)))
             dims = {k: dynlog.em_dims(self.p(f(ref, ite) if k != "mask" else f(ite)))
@@ -1220,16 +1262,22 @@ class DynamoProject:
             try:
                 self.average(ite, iref)
             except FatalIterationError:
+                # pipeline.average returned ok = false: the echo comes before the ok test (assemble :343-355)
+                self.append_log([avg_lines[iref]])
                 self._fatal_assemble(ite, "[assemble] did create apparently valid table files, but it failed while "
                                           "using them  for averaging")
                 raise
             info["average_s"] = round(time.perf_counter() - t0, 3)
             self.append_log([avg_lines[iref]])
-            ref = iref
-            # 8. dynamo_sym(average, op, 'fmask', fmask_average, 'foutput', 'binary') (assemble :457-479; 10a 5.2).
-            # c1: dynamo_sym returns its inputs (06b 8)
-            op = self.rv("sym", rnd)
-            from .symmetry import parse_sym, dynamo_sym
+        self.append_log([dynlog.assemble_average_done_line(time.time() - t_avg0)])
+        # 8. dynamo_sym(average, op, 'fmask', fmask_average, 'foutput', 'binary') (assemble :457-479; 10a 5.2), in
+        # its own loop after every reference is averaged (:331-360) and the 'done' line (:362-369).
+        # c1: dynamo_sym returns its inputs (06b 8)
+        op = self.rv("sym", rnd)
+        from .symmetry import parse_sym, dynamo_sym
+        for ref in range(1, nref + 1):
+            if ref not in refs:
+                continue
             if parse_sym(op)[0] == "none":
                 dynio.write_em(self.f_av("average_symmetrized", ref, ite),
                                dynio.read_em(self.f_av("average", ref, ite)))
@@ -1240,7 +1288,6 @@ class DynamoProject:
                                     dynio.read_em(self.f_av("fmask_average", ref, ite)), "binary")
                 dynio.write_em(self.f_av("average_symmetrized", ref, ite), As)
                 dynio.write_em(self.f_av("fmask_average_symmetrized", ref, ite), Fs)
-        self.append_log([dynlog.assemble_average_done_line(time.time() - t_avg0)])
         # 9. convergence (type 0 never saturates; writes nothing) -> next = ite + 1
         nxt = ite + 1
         dynio.write_txt(self.p("next_iteration.txt"), nxt)
@@ -1316,7 +1363,12 @@ class DynamoProject:
         T = np.real(np.asarray(table))
         rows = T[T[:, 2] == 1]
         if len(rows) == 0:
-            raise FatalIterationError("no particle with col 3 == 1 for averaging")
+            # genericInput2Average.m:298-301 returns before its output 'flags' is assigned (:316), which
+            # pipeline/average.m:100 requests: a MATLAB error, not ok = false. Nothing catches it (assemble :343,
+            # dynamo_execute_project.m:185): no 'Computing average for ref' line, no fatal_error, next_iteration.txt
+            # unchanged. A plain RuntimeError, which assemble does not turn into _fatal_assemble.
+            raise RuntimeError("no particle with col 3 == 1 for averaging: Dynamo stops with a MATLAB error here "
+                               "(genericInput2Average.m:298-301, 'Sorry, not tags survive: aborting')")
         if len(rows) == 1:                    # genericInput2Average.m:292-294: one tag -> no fsc, a different path
             raise NotImplementedError("averaging a single particle (dynamo_average without the even/odd FSC) is not "
                                       "ported")
@@ -1420,7 +1472,10 @@ class DynamoProject:
     # ------------------------------------------------------------------ check (06c A.4)
     def check(self, ite):
         """dynamo_iteration_check.m:60-114: every item of every surviving reference must exist and hold no NaN
-        (item-major order as in the source); the reason of a fatal error is the entity text of the last failure."""
+        (item-major order as in the source); the reason of a fatal error is the entity text of the last failure.
+        Returns True, or False after fatal_error (:106, :118-149), which returns normally: the loop of
+        dynamo_execute_project.m then finds next_iteration > N and returns (:144-147), or ends. Missing or empty
+        surviving references of ite + 1 are errors in Dynamo (:62-64) and raise here."""
         refs = self.get_surviving_refs(ite + 1)
         problems, reason = [], None
         for kind, ext in (("refined_table", "tbl"), ("average", "em"), ("fmask_average", "em")):
@@ -1439,8 +1494,10 @@ class DynamoProject:
         if problems:
             dynio.write_txt(self.p("next_iteration.txt"), self.N + 1)  # fatal_error: deactivate the rest
             self.append_log(dynlog.check_fatal_lines(ite, reason))
-            raise FatalIterationError("FATAL ERROR DETECTED IN ITERATION %d: %s" % (ite, "; ".join(problems)))
+            self.log("FATAL ERROR DETECTED IN ITERATION %d: %s" % (ite, "; ".join(problems)))
+            return False
         self.append_log(dynlog.check_ok_lines(ite))
+        return True
 
     # ------------------------------------------------------------------ driver (06c A.2, A.5)
     def run(self, iterations=None):
@@ -1477,12 +1534,15 @@ class DynamoProject:
                 it.update(self.assemble(ite, refs))
                 it["assemble_s"] = round(time.perf_counter() - t0, 3)
                 t0 = time.perf_counter()
-                self.check(ite)
+                ok = self.check(ite)                  # False: next_iteration.txt = N + 1, the next pass stops
                 it["check_s"] = round(time.perf_counter() - t0, 3)
                 it["wall_s"] = round(it["setup_s"] + it["compute_s"] + it["assemble_s"] + it["check_s"], 3)
+                if not ok:
+                    it["fatal"] = True
                 self.report["iterations"].append(it)
-                self.log("iteration %d ok (setup %.1f s, compute %.1f s, assemble %.1f s)"
-                         % (ite, it["setup_s"], it["compute_s"], it["assemble_s"]))
+                self.log("iteration %d %s (setup %.1f s, compute %.1f s, assemble %.1f s)"
+                         % (ite, "ok" if ok else "failed the check", it["setup_s"], it["compute_s"],
+                            it["assemble_s"]))
                 self._write_report(t_all)
         finally:
             self.close()

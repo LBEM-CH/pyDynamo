@@ -34,6 +34,7 @@ import numpy as np
 from . import convention as _conv
 from . import dcp_parameters as _cls
 from . import dynio
+from . import launch as _launch
 from . import vpr as V
 from .vpr import DynamoError
 
@@ -53,7 +54,9 @@ ROUND_AREAS_ON = ("general", "angles", "threshold", "limits", "correlation")
 DESTINATIONS = ("matlab", "matlab_parfor", "standalone", "matlab_gpu", "standalone_gpu", "mpi", "mpi_gpu")
 ENVIRONMENT_PARAMETERS = ("how_many_processors", "gpu_identifier_set", "gpu_motor", "cluster_header",
                           "cluster_walltime", "submit_order", "matlab_workers_average")
-PYDYN_EXECUTES = ("standalone_gpu", "matlab_gpu")      # pydyn.execute.execute_project
+# the destination pydyn runs: execute.execute_project accepts matlab_gpu as Dynamo's does, but the run itself
+# (dynproject.DynamoProject.validate) implements standalone_gpu only
+PYDYN_EXECUTES = ("standalone_gpu",)
 # S/+dpkproject/+aux/+gui/@ABPManager/launchGUI.m: the parameters of the "Adaptive bandpass parameters" editor
 ABP_PARAMETERS = ("adaptive_bandpass", "adaptive_bandpass_threshold", "abp_recompute_second_average",
                   "adaptive_bandpass_initial", "adaptive_bandpass_pushback", "adaptive_bandpass_symmetrized",
@@ -114,7 +117,9 @@ def str2num(s):
                 raise NotImplementedError("str2num(%r): range syntax" % s)
             p = [_num_token(x) for x in parts]
             a, st, b = (p[0], 1.0, p[1]) if len(p) == 2 else p
-            if not all(float(x).is_integer() for x in (a, st, b)) or st == 0:
+            if st == 0 and math.isfinite(a) and math.isfinite(b):
+                continue                             # MATLAB j:0:k is empty (1x0): str2num('01:00:00') = 1:0:0 = []
+            if not all(float(x).is_integer() for x in (a, st, b)):
                 raise NotImplementedError("str2num(%r): only integer a:b / a:s:b ranges are ported" % s)
             n = int(math.floor((b - a) / st)) + 1
             vals += [a + i * st for i in range(max(n, 0))]
@@ -403,6 +408,7 @@ class DcpController:
                     base, r = k.rsplit("_r", 1)
                     print('[warning] : vpr misses a parameter of type"%s" in round %d' % (base, int(r)))
                 rt[k] = class_value(parameter(base))
+        rt.update(_launch.pydyn_fields(vpr))         # pyDynamo's own computing parameters, when the vpr has them
         return rt
 
     def _set_single_reference_project(self):
@@ -447,7 +453,8 @@ class DcpController:
         if value is None or (isinstance(value, str) and value == ""):
             return o
         if not (os.path.isfile(value) or os.path.isdir(value)):
-            self.echo('The string "%s" is neither a file nor a folder.' % value, "r")
+            # o.echo of a pparse.output (scanSeedsInFolder.m:67-70): disp on the screen, not into the dcp window
+            print('The string "%s" is neither a file nor a folder.' % value)
             o["ok"] = False
             return o
         if os.path.isfile(value):
@@ -467,7 +474,9 @@ class DcpController:
         return o
 
     def available_seeds(self, item, get_sizes=False):
-        """S/@dcp/availableSeeds.m: the seed files of template / table / fmask (single: the value itself)."""
+        """S/@dcp/availableSeeds.m: the seed files of template / table / fmask (single: the value itself). 'report'
+        holds the lines of its o.echo, which Dynamo prints on the screen (pparse.output: disp) and which reach the
+        dcp window only where a caller echoes the report (templateEnter.m:41; checkSteps.m does not)."""
         field = {"template": "file_template_initial", "table": "file_table_initial",
                  "fmask": "file_fmask_initial"}[item]
         if int(float(self.runtime["nref_r1"])) == 1:
@@ -475,14 +484,44 @@ class DcpController:
         else:
             o = self.scan_seeds_in_folder(self.runtime[field], item)
             o["ok"] = bool(o["files"])
+        o["report"] = []
         if get_sizes:
             sizes = [read_size(f) for f in o["files"]]
             if any(sizes[i] != sizes[i - 1] for i in range(1, len(sizes))):
-                self.echo("Not all templates have the same dimensionality.")
+                msg = "Not all templates have the same dimensionality."             # availableSeeds.m:66-70
+                print(msg)
+                o["report"].append(msg)
                 o.update(ok=False, size=None)
             else:
                 o.update(ok=True, size=sizes[0] if sizes else None)
         return o
+
+    def project_template_size(self):
+        """@dProject/getTemplateSize.m, the size the mask checks use (@file_mask/checkValue.m:26,
+        @file_mask_classification/checkValue.m:13, @file_mask_smoothing/checkValue.m:13): the seeds of the current
+        file_template_initial are read each time (not the stored dcp size). None when a seed is not a file, there is
+        none, or their sizes differ; the o.echo lines go to the screen (pparse.output: disp)."""
+        rt = self.runtime
+        if not rt:
+            return None
+        value = rt["file_template_initial"]
+        if int(float(rt["nref_r1"])) == 1:                                      # getTemplateSize.m:18-21
+            files = [value]
+        else:                                                                    # :22-26
+            files = self.scan_seeds_in_folder(value, "template")["files"]
+        sizes = []
+        for i, f in enumerate(files, 1):
+            if not (isinstance(f, str) and os.path.isfile(f)):                  # exist(...,'file')~=2 (:37-41)
+                print("Template file (%d) does not exist: %s" % (i, f))
+                return None
+            sizes.append(read_size(f))
+        if not sizes:                                                            # :51-56
+            print("Empty templates.")
+            return None
+        if any(sizes[i] != sizes[i - 1] for i in range(1, len(sizes))):         # :58-62
+            print("Not all templates have the same dimensionality.")
+            return None
+        return sizes[0]
 
     # ------------------------------------------------------------------------------------------------ dcp.put
     def put(self, parameter_name, value, round=None):
@@ -498,12 +537,33 @@ class DcpController:
     def _gui_save(self):
         """S/@dProject/setParameter.m:57-64 with 'inDisk': vpr = getVpr() (getVpr.m: the convention fields in
         dynamo_vpr order, values of the runtime), dynamo_vpr_save(vpr). ./decoy is not created (module doc)."""
-        vpr = {k: self.runtime[k] for k in V.blank(self.name)}
+        vpr = self.get_vpr()
         V.save(vpr)
 
     def get_vpr(self):
-        """@dProject/getVpr (in memory)."""
-        return {k: self.runtime[k] for k in V.blank(self.name)}
+        """@dProject/getVpr (in memory), plus pyDynamo's own computing parameters the project holds (pydyn.launch;
+        Dynamo's window would drop them)."""
+        vpr = {k: self.runtime[k] for k in V.blank(self.name)}
+        vpr.update(_launch.pydyn_fields(self.runtime))
+        return vpr
+
+    def pydyn_edit(self, name, string):
+        """A pyDynamo computing parameter (pydyn.launch.PARAMS: submit to Slurm, the job's CPU cores, memory and
+        partitions) from its box in the computing environment window: load the vpr, set or remove the field, save."""
+        self.require_project()
+        try:
+            vpr = V.load(self.name)
+            value = _launch.put(vpr, name, string)
+        except _launch.LaunchError as e:
+            self.echo("Invalid value for parameter \"%s\"" % _launch.PRETTY.get(name, name), "r")
+            self.echo(str(e), "r")
+            return Check(False, [str(e)])
+        V.save(vpr)
+        self.runtime.pop(name, None)
+        self.runtime.update(_launch.pydyn_fields(vpr))
+        shown = ("%g" % value) if isinstance(value, float) else value          # as typed, like _gui_edit's echo
+        self.echo('"%s"  in disk  set to "%s"' % (_launch.PRETTY[name], shown))
+        return Check(True)
 
     # ------------------------------------------------------------------------------------------------ checks
     def template_size(self, force=True):
@@ -579,9 +639,10 @@ class DcpController:
         return Check(True)
 
     def _mask_size(self, value, label, require_file):
-        """file_mask / file_mask_classification / file_mask_smoothing checkValue.m: size against the template. The
-        texts are Dynamo's, including its typos in @file_mask/checkValue.m:20 ('as  mask') and :39 ('correspondo')."""
-        ts = self.template_size()
+        """file_mask / file_mask_classification / file_mask_smoothing checkValue.m: size against the template, read
+        from the current seeds (dProject.getTemplateSize: project_template_size). The texts are Dynamo's, including
+        its typos in @file_mask/checkValue.m:20 ('as  mask') and :39 ('correspondo')."""
+        ts = self.project_template_size()
         if ts is None:
             return Check(True)
         is_mask = label == "mask"
@@ -757,12 +818,20 @@ class DcpController:
         return c
 
     def template_enter(self, file):
-        """dcp.templateEnter (S/@dcp/templateEnter.m)."""
+        """dcp.templateEnter (S/@dcp/templateEnter.m). The stored template size comes from the seeds
+        (dcp.availableSeeds('template','getSizes',true), :23-46): the file, or for nref > 1 the seeds in the folder,
+        and the size of the first one. When their sizes differ Dynamo echoes its error and the report and returns:
+        the template stays flagged correct, the stored size is the previous one."""
         c = self._enter_file_parameter(file, "file_template_initial")
         if c.ok:
             self.correct["template"] = True
             self._enable("masks", True)
-            self.template_size_cache = read_size(file)
+            seeds = self.available_seeds("template", get_sizes=True)          # templateEnter.m:25
+            if seeds["ok"]:
+                self.template_size_cache = seeds["size"]                      # :27-35
+            else:
+                self.echo("Error: something went wrong when entering template. Aborting.", "r")    # :40
+                self.echo(seeds["report"], "r")                                                   # :41
         else:
             self.correct["template"] = False
             self._cascade("masks", False)
@@ -772,7 +841,11 @@ class DcpController:
         """"average all" of the template window (S/@dcp/callbackTemplateAverage.m, single reference): dynamo_average
         of the project data with the project table and all its tags, written to <name>/settings/computedAverage.em,
         then templateEnter. fcompensate 0 and [] take the same path in dynamo_average.m (:732, :2150), so this is
-        pydyn.daverage's default path."""
+        pydyn.daverage's default path. In 1.1.514 the callback has no return after its templateEnter (:159) and runs
+        an older copy of itself (:162-239): the average again with the data tags (facts.tags, restricted to the table
+        by dynamo__parse_tags_average.m:136-142, then to the data by dynamo_average.m:1301: the same tags), the
+        same table and 'fcompensate' 0, into the same file, and templateEnter again. That pass writes the same
+        computedAverage.em, so pydyn runs it once (its messages then appear once, Dynamo shows them twice)."""
         self.require_project()
         if int(float(self.runtime["nref_r1"])) > 1:
             raise NotImplementedError("average all for multireference projects")

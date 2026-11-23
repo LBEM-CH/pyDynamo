@@ -64,7 +64,7 @@ def _execute_args(e):
     e.add_argument("name")
     e.add_argument("--gpus", default=None,
                    help="comma-separated device ids, or all: every GPU this process sees (in a Slurm job, the job's "
-                        "own), up to the number of particle parts. Default: gpu_identifier_set, as Dynamo")
+                        "own); either is cut to the number of particle parts. Default: gpu_identifier_set, as Dynamo")
     e.add_argument("--engine", choices=("exact", "fast"), default=None,
                    help="GPU alignment engine. exact: Dynamo 1.1.514's own kernels, cuFFT 8 and cuBLAS 8, bit-identical "
                         "to the official engine on the same GPU model; fast: pyDynamo's batched engine (float32 "

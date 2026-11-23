@@ -164,9 +164,52 @@ def check_sym(op, n):
     return kind
 
 
+def _as_loaded(vpr):
+    """The vpr as adaptiveFiltering.m:122 has it (dynamo_vpr_load): the missing convention parameters added
+    (dynamo_vpr_load.m:124, +dpkproject/+vpr/addMissingConventionParameters.m), so an absent file_mask_smoothing is
+    'my_smask.em' (dynamo_vpr_convention.m:264)."""
+    from . import vpr as V
+    return V.add_missing_convention_parameters(dict(vpr))
+
+
+def _source_file(proj, f):
+    """A vpr file string resolved for the checks: './<name>/...' in the source project (the run folder may not be
+    filled yet), anything else relative to Dynamo's working directory."""
+    for pre in ("./" + proj.name + "/", proj.name + "/"):
+        if f.startswith(pre):
+            return os.path.join(proj.source, f[len(pre):])
+    return f if os.path.isabs(f) else os.path.join(proj.cwd, f)
+
+
+def _em_size(f, what, double=False):
+    """[nx, ny, nz] of a mask file that dynamo_read reads with dynamo_read_emfile (.em/.sem/.btbl,
+    dynamo_read.m:329-330; header words 2-4). Any other file is refused: dynamo_read_mrc_simple (dynamo_read.m:332-333)
+    and the other readers return their own classes (single for an .mrc of mode 2, pydyn.console.read_mrc), not the
+    double pydyn computes with. double: also refuse EM data type 1, which dynamo_read_emfile returns as uint8
+    (dynamo_read_emfile.m:96-97); MATLAB's double .* uint8 is uint8."""
+    if os.path.splitext(f)[1][1:] not in ("em", "sem", "btbl"):
+        raise NotImplementedError("adaptive bandpass with a %s %r that is not an EM file (dynamo_read.m:332-333 and "
+                                  "the other readers give their own class, not double)" % (what, f))
+    with open(f, "rb") as fh:
+        h = fh.read(16)
+    if len(h) < 16 or h[0] not in (0, 3, 5, 6) or h[3] not in (1, 2, 5):
+        raise NotImplementedError("adaptive bandpass with a %s %r whose EM header dynamo_read_emfile does not read "
+                                  "(dynamo_read_emfile.m:69-81, :95-108 error)" % (what, f))
+    if double and h[3] == 1:
+        raise NotImplementedError("adaptive bandpass with a uint8 %s %r (dynamo_read_emfile.m:96-97; double .* uint8 "
+                                  "is uint8 in MATLAB)" % (what, f))
+    size = [int(x) for x in np.frombuffer(h[4:16], (">" if h[0] in (0, 3, 5) else "<") + "u4")]
+    if os.path.getsize(f) < 512 + size[0] * size[1] * size[2] * {1: 1, 2: 2, 5: 4}[h[3]]:
+        raise NotImplementedError("adaptive bandpass with a %s %r shorter than its EM header says "
+                                  "(dynamo_read_emfile.m:95-103 reshape error)" % (what, f))
+    return size
+
+
 def check_supported(vpr, rounds, proj=None):
     """Raise NotImplementedError for golden-mode settings this port does not reproduce, before any computation.
-    With `proj`, also the vpr.file_mask that dynamo_align reads (cwd-relative, dynamo_align.m:963, :974)."""
+    With `proj`, also the vpr.file_mask that dynamo_align reads (cwd-relative, dynamo_align.m:963, :974) and an
+    existing vpr.file_mask_smoothing (getSmoothingMask.m:17-24), which is otherwise read only after reference 2's
+    files have been rewritten."""
     if int(float(vpr["nref_r1"])) != 2:
         raise NotImplementedError("adaptive bandpass needs nref 2 (dynamo_vpr_check errors otherwise)")
     from .dalign import BASIC, motor_area, check_motor_area
@@ -185,18 +228,19 @@ def check_supported(vpr, rounds, proj=None):
     if proj is not None:
         # a missing or non-3-D file_mask makes dynamo_align fall back to dynamo_ellipsoid(floor(N/2), N) with an
         # unterminated 'r=floor(d/2)' echo (dynamo_file_checkout.m returns the string, dynamo_align.m:1068-1082)
-        f = str(vpr.get("file_mask", ""))
-        for pre in ("./" + proj.name + "/", proj.name + "/"):          # checked in the source project: the run
-            if f.startswith(pre):                                      # folder may not be filled yet
-                f = os.path.join(proj.source, f[len(pre):])
-                break
-        else:
-            f = f if os.path.isabs(f) else os.path.join(proj.cwd, f)
+        f = _source_file(proj, str(vpr.get("file_mask", "")))
         if not str(vpr.get("file_mask", "")) or not os.path.isfile(f):
             raise NotImplementedError("adaptive bandpass with a missing file_mask %r (dynamo_align.m:1068-1082 "
                                       "default ellipsoid)" % vpr.get("file_mask"))
-        if np.ndim(dynio.read_em(f)) != 3:
+        size = _em_size(f, "file_mask")
+        if size[2] == 1:                                               # MATLAB's ndims of reshape(.., nx, ny, 1) is 2
             raise NotImplementedError("adaptive bandpass with a file_mask that is not 3-D (dynamo_align.m:1072-1076)")
+        # a missing smoothing mask is not used (getSmoothingMask.m:19-22)
+        fs = str(_as_loaded(vpr)["file_mask_smoothing"])
+        if fs and os.path.isfile(_source_file(proj, fs)):
+            if _em_size(_source_file(proj, fs), "file_mask_smoothing", double=True) != size:
+                raise NotImplementedError("adaptive bandpass with a file_mask_smoothing %r of another size than the "
+                                          "file_mask (applySmoothingMask.m:17)" % fs)
 
 
 # =====================================================================================================================
@@ -279,7 +323,8 @@ def adaptive_filtering(proj, ite):
     else:
         o("Computing resolution without symmetry.")
         V1, V2 = A[0], A2n
-    V1, V2 = apply_smoothing_mask(proj, vpr, V1), apply_smoothing_mask(proj, vpr, V2)
+    svpr = _as_loaded(vpr)                                           # Dynamo's vpr of :122 (dynamo_vpr_load)
+    V1, V2 = apply_smoothing_mask(proj, svpr, V1), apply_smoothing_mask(proj, svpr, V2)
     curve = fsc(V1, V2)
     if curve is None:
         raise RuntimeError("dynamo_fsc returned [] (NaN in a volume): Dynamo crashes on .fsc")
@@ -305,9 +350,7 @@ def adaptive_filtering(proj, ite):
     info = {"fp": int(fp), "new_low": new_low, "Tp_shifts": [float(x) for x in tp_s],
             "Tp_eulers": [float(x) for x in tp_e], "ccmax": [float(x) for x in sal["ccmax"]]}
     if new_low < 2:                                                  # :356-364
-        o(" ")
-        o("New low pass is too low! You are killing all the frequencies!!")
-        raise RuntimeError("aborting!")
+        too_low(o)
     next_round = ite2round(vpr, ite + 1)                             # :368-373
     if next_round is None:
         # dynamo_intertwin_ite2round.m:54-57 disp()s this before returning [] [RUN: eo_dynamo514_run.log:529994]
@@ -329,14 +372,33 @@ def adaptive_filtering(proj, ite):
     return info
 
 
+def too_low(o):
+    """adaptiveFiltering.m:356-364, new low pass < 2. In matlab/mbtools/+mbparse/@output: o.error(5) prints 5 lines of
+    60 '#' on the screen only (output.m:193-213, mbg.dispv to 'screen'); each o.e(' ') is o.echo(' ') (e.m:72-74),
+    which also goes into log.txt with the leading (echo.m:35-43, :101-116); then error('aborting!')."""
+    for _ in range(5):
+        print("#" * 60, flush=True)
+    o(" ")
+    o(" ")
+    o("New low pass is too low! You are killing all the frequencies!!")
+    o(" ")
+    o(" ")
+    raise RuntimeError("aborting!")
+
+
 def apply_smoothing_mask(proj, vpr, v):
-    """+dpkproject/+mask/applySmoothingMask.m:7-17: v .* raw file_mask_smoothing (cwd-relative); a missing field or
-    file leaves the volume unmasked."""
-    f = vpr.get("file_mask_smoothing")
-    if not f or not os.path.isfile(_read_rel(proj, str(f))):
-        print("[smoothing mask] no smoothing mask file: volume used without mask")
+    """+dpkproject/+mask/applySmoothingMask.m:7-17 with getSmoothingMask.m:1-24: v .* dynamo_read of
+    vpr.file_mask_smoothing (the raw string, cwd-relative). A missing field or file leaves the volume unmasked, with
+    getSmoothingMask's message on the screen (o = mbs.o: no leading, no log file)."""
+    if "file_mask_smoothing" not in vpr:                             # getSmoothingMask.m:12-15
+        print("Smoothing mask parameter not defined in this project!", flush=True)
         return v
-    m = dynio.read_em(_read_rel(proj, str(f)))
+    f = str(vpr["file_mask_smoothing"])
+    if not f or not os.path.isfile(_read_rel(proj, f)):              # getSmoothingMask.m:19-22
+        print("Smoothing mask file is not existing: %s" % f, flush=True)
+        return v
+    _em_size(_read_rel(proj, f), "file_mask_smoothing", double=True)
+    m = dynio.read_em(_read_rel(proj, f))
     if m.shape != v.shape:
         raise NotImplementedError("smoothing mask of another size")
     return v * m

@@ -26,7 +26,7 @@ const BUSY_TEXT = { template_average: "averaging all particles", check: "checkin
   masks_use_defaults: "making the default masks", data_enter: "reading the data folder", editor_save: "saving the mask",
   create: "creating the project", enter_project_name: "opening the project" };
 const QUIET = new Set(["rounds_table", "comment", "parameter_help", "list_projects", "environment_values", "abp_parameters", "editor_slices",
-  "set_value"]);
+  "set_value", "run_settings", "run_status"]);
 
 const S = { meta: null, st: null, page: "home", seq: 0, pending: 0, marks: {}, pendingBox: null,
   rounds: { areas: null, adv: false, roundMode: true, sel: null, rows: [], cols: [] },
@@ -224,6 +224,7 @@ async function renderMain() {
   m.innerHTML = await f();
   if (S.page === "settings") await loadRounds();
   if (S.page === "masks") { insInit(); edInit(); }
+  if (S.page === "run" && $("#runJob") && $("#runJob").dataset.active === "1") runPoll();
 }
 
 async function pageHome() {
@@ -702,9 +703,10 @@ async function pageDestination() {
   const r = await call("environment_values");
   const vals = r.ok ? r.result : {};
   const ids = projectGpus(vals.gpu_identifier_set), n = ids.length;
-  const plan = await getJSON(`/api/slurm?gpus=${Math.max(1, n)}`).catch(() => ({ slurm: false }));
-  const most = Math.max(plan.most_gpus || 0, n, 1);
-  const zeroBased = n && ids.every((x, k) => x === k);
+  const rs = await runSettings();
+  const slurm = !!rs && rs.mode === "slurm";                      // buttons up to what the run can get
+  const most = slurm ? Math.max(((rs.plan || {}).most_gpus) || 0, n, 1)
+    : Math.max((await getJSON("/api/gpus").catch(() => [])).length, n, 1);
   const hmp = String((vals.how_many_processors || ["1"])[0]).trim();
   const hmpNote = hmp === "1" ? "" : `<div class="alert alert-warning d-flex align-items-center gap-3 mt-3 mb-0"><i class="bi bi-exclamation-triangle-fill fs-4"></i>
       <div class="flex-grow-1">The project splits each GPU's particles into ${esc(hmp)} blocks (<span class="mono">how_many_processors</span>, from Dynamo).
@@ -712,18 +714,14 @@ async function pageDestination() {
       <button class="btn btn-primary text-nowrap" data-act="hmp-1">Use one block</button></div>`;
   const buttons = Array.from({ length: most }, (_, k) => k + 1).map((k) =>
     `<button class="btn ${k === n ? "btn-primary" : "btn-outline-primary"}" data-gpus="${k}">${k}</button>`).join("");
-  const where = !plan.slurm ? `<span class="text-body-secondary">Slurm was not found on this machine (sinfo).</span>`
-    : (plan.machines || []).length ? `As a Slurm job (Run step) it can start on ${machinesText(plan)}: Slurm picks the one that has ${n === 1 ? "a GPU" : n + " GPUs"} free first, and the job waits in the queue until then.`
-    : `<span class="text-danger">No machine of the shared Slurm partitions has ${n} GPUs.</span>`;
-  return pageHead("destination", "How many GPUs pyDynamo runs the project on.") +
+  return pageHead("destination", "How many GPUs pyDynamo runs the project on, and where: on this machine or as a Slurm job.") +
     `<div class="cardx"><h2><i class="bi bi-gpu-card"></i>GPUs <span class="hint">each click is saved into the project</span></h2>
        <div class="d-flex align-items-center gap-3 flex-wrap"><div class="btn-group" role="group" aria-label="number of GPUs">${buttons}</div>
          <span class="fw-semibold">${n} GPU${n === 1 ? "" : "s"}</span></div>
-       <div class="small mt-3">pyDynamo splits the particles into ${n} part${n === 1 ? "" : "s"}, one per GPU, as Dynamo does, and the project's files follow that split; the default exact engine aligns 128 orientations per batch on each GPU.
+       <div class="small mt-3">pyDynamo splits the particles into ${n} part${n === 1 ? "" : "s"}, one per GPU, as Dynamo does, and the project's files follow that split; the default exact engine aligns up to 128 orientations per batch on each GPU.
          Saved in the project as <span class="mono">gpu_identifier_set = ${esc(ids.join(" ") || "none")}</span>.</div>
-       <div class="small mt-2">${where}</div>
-       ${zeroBased || !n ? "" : `<div class="small text-warning-emphasis mt-2"><i class="bi bi-info-circle me-1"></i>The project names devices ${esc(ids.join(" "))}. A Slurm job numbers its GPUs from 0, so the Run step runs it on the job's GPUs (<span class="mono">--gpus all</span>); click a number to save devices 0 to n−1.</div>`}
-       ${hmpNote}</div>`;
+       ${hmpNote}</div>
+     ${runWhereCard(rs, ids)}`;
 }
 async function setGpuCount(k) {
   const cur = projectGpus(S.st.fields.gpu_identifier_set);
@@ -731,6 +729,53 @@ async function setGpuCount(k) {
   const e = await call("environment_edit", ["gpu_identifier_set", Array.from({ length: k }, (_, x) => x).join(" ")]);
   S.marks["env:gpu_identifier_set"] = okCheck(e);
   await renderMain();
+}
+
+/* ---- where the Run step runs the project (pydyn.launch): the project's computing parameter pydyn_slurm, a check
+   box. Unticked, on this machine's GPUs (gpu_identifier_set); ticked, as a Slurm job asking for that many GPUs, with
+   the job's CPU cores, RAM and partitions (pyDynamo's pydyn_slurm_* fields) and Dynamo's own cluster_walltime
+   (--time) and submit_order (sbatch). Every change is saved into the project (settings/virtual_project.mat). */
+async function runSettings() {
+  const r = await call("run_settings");
+  return r.ok ? r.result : null;
+}
+async function runSet(name, value) {
+  const r = await call("run_set", [name, value]);
+  S.marks["run:" + name] = okCheck(r);
+  await renderMain();
+}
+function runField(name, label, value, placeholder, title, width = "col-6 col-md-4") {
+  return `<div class="${width}"><label class="form-label small mb-1"${title ? ` title="${esc(title)}"` : ""}>${label}</label>
+    <input class="form-control form-control-sm mono" data-run="${name}" value="${esc(value)}" placeholder="${esc(placeholder || "")}" spellcheck="false"></div>`;
+}
+function runWhereCard(rs, ids) {
+  if (!rs) return "";
+  const slurm = rs.mode === "slurm", n = rs.gpus, plan = rs.plan || {};
+  const box = `<div class="form-check form-switch fs-6"><input class="form-check-input" type="checkbox" role="switch" id="runSlurm"${slurm ? " checked" : ""}>
+      <label class="form-check-label fw-semibold" for="runSlurm">Submit to Slurm</label></div>`;
+  if (!slurm) {
+    return `<div class="cardx"><h2><i class="bi bi-hdd-network"></i>Where it runs <span class="hint">saved into the project</span></h2>${box}
+      <div class="small mt-2">The Run step runs the project on <b>this machine's GPUs</b> (devices <span class="mono">${esc((ids || []).join(" ") || "0")}</span>), in the background; its output goes to <span class="mono">pydyn_${esc(rs.name)}.out</span> next to the project.
+        Tick the box to submit it as a Slurm job instead.</div></div>`;
+  }
+  const where = !plan.slurm ? `<span class="text-danger">Slurm was not found on this machine (sinfo): the job cannot be submitted from here.</span>`
+    : (plan.machines || []).length ? `Slurm can start it on ${machinesText(plan)}, on the first that has ${n === 1 ? "a GPU" : n + " GPUs"} free; while the cluster is busy the job waits in the queue.`
+    : `<span class="text-danger">No machine of the shared partitions has ${n} GPUs${plan.most_gpus ? ` (at most ${plan.most_gpus} per machine)` : ""}: this job would never start.</span>`;
+  const time = rs.walltime === "00:10:00" ? `<div class="small text-warning-emphasis mt-2"><i class="bi bi-clock me-1"></i>The time limit is Dynamo's default, 10 minutes: Slurm ends the job when it is up. Set the time the whole run needs.</div>` : "";
+  return `<div class="cardx"><h2><i class="bi bi-hdd-network"></i>Where it runs <span class="hint">saved into the project</span></h2>${box}
+    <div class="small mt-2 mb-3">The Run step submits the project as a <b>Slurm job</b> asking for ${n} GPU${n === 1 ? "" : "s"} (the GPU count above) on one machine; inside the job pyDynamo uses the job's GPUs.</div>
+    <div class="row g-2">
+      ${runField("pydyn_slurm_cpus", "CPU cores", String(rs.cpus), "", "--cpus-per-task")}
+      ${runField("pydyn_slurm_mem", "RAM (main memory)", rs.mem, rs.mem_estimate + " (estimated)", "--mem: the job's main memory; GPU memory is not asked for")}
+      ${runField("cluster_walltime", "Time limit (hh:mm:ss)", rs.walltime, "", "--time; Dynamo's cluster_walltime")}
+      ${runField("pydyn_slurm_partition", "Partitions", rs.partition, (plan.partitions || []).join(",") || "the cluster's default", "--partition; empty: the shared partitions whose machines have that many GPUs", "col-12 col-md-8")}
+      ${runField("submit_order", "Submit command", rs.submit_order, "sbatch", "Dynamo's submit_order")}
+    </div>
+    <div class="small mt-2">${where}</div>${time}
+    <div class="small text-body-secondary mt-2">${ramNote(rs)} The time limit and the submit command are Dynamo's <span class="mono">cluster_walltime</span> and <span class="mono">submit_order</span>, which Dynamo also writes into the cards: unfold again after changing them.</div></div>`;
+}
+function ramNote(rs) {
+  return `<b>RAM</b> is the job's main memory (<span class="mono">--mem</span>), not GPU memory: the job's GPUs are its own, with all their memory. Left empty, it is estimated from the data (${esc(rs.mem_estimate)}): pyDynamo keeps the particles in RAM during the alignment and holds twice that while reading them, plus a margin of 4 GB per GPU process.`;
 }
 
 /* ---- check / unfold / run */
@@ -760,100 +805,49 @@ function unfoldStatusHTML(st) {
 }
 async function pageRun() {
   const st = S.st;
-  const k = slurmGpuCount(st);
-  if (!SL.plan || SL.plan.gpus !== k) SL.plan = await getJSON(`/api/slurm?gpus=${k}`).catch(() => ({ slurm: false }));
-  const cmd = st.order || "";
-  return pageHead("run", "Run the unfolded project from a terminal in this folder, with pyDynamo's environment active: the script is Dynamo's own, and its last line calls dynamo_execute_project.") +
-    `<div class="cardx"><h2><i class="bi bi-terminal"></i>In a terminal</h2>
-       <div class="cmdbox"><code>${esc(cmd)}</code><button class="btn btn-sm btn-outline-light" data-copy="${esc(cmd)}"><i class="bi bi-clipboard"></i></button></div>
-       <div class="small mt-3">${unfoldStatusHTML(st)}</div></div>
-     ${slurmCard(st)}`;
+  const rs = await runSettings();
+  if (!rs) return pageHead("run", "Run the unfolded project.") + `<div class="cardx"><div class="text-body-secondary">No project is open.</div></div>`;
+  const slurm = rs.mode === "slurm", job = rs.status, ready = rs.unfold && rs.unfold.current;
+  const busy = job && job.active;
+  const label = slurm ? "Submit to Slurm" : "Run on this machine's GPUs";
+  const where = slurm ? `as a Slurm job (${rs.gpus} GPU${rs.gpus === 1 ? "" : "s"}, ${rs.cpus} CPU cores, ${esc(rs.mem || rs.mem_estimate)} RAM${rs.walltime ? ", time limit " + esc(rs.walltime) : ""})`
+    : `on this machine's GPUs (devices <span class="mono">${esc((rs.devices || []).join(" ") || "0")}</span>)`;
+  const why = !ready ? `<div class="small text-warning-emphasis mt-2"><i class="bi bi-exclamation-triangle me-1"></i>${rs.unfold ? "Parameters were changed after the unfold: check and unfold again before running." : "Unfold the project first."}</div>`
+    : busy ? `<div class="small text-body-secondary mt-2">The last run is still ${esc(job.state.toLowerCase())}: stop it before starting another.</div>` : "";
+  return pageHead("run", "Runs the unfolded project where the Computing environment says: on this machine's GPUs, or as a Slurm job.",
+      `<button class="btn btn-primary" data-act="run-start"${ready && !busy ? "" : " disabled"}><i class="bi bi-play-fill me-1"></i>${label}</button>`) +
+    `<div class="cardx"><h2><i class="bi bi-${slurm ? "hdd-network" : "gpu-card"}"></i>${slurm ? "As a Slurm job" : "On this machine"} <span class="hint">change it in Computing environment</span></h2>
+       <div class="small mb-2">The Run step runs pyDynamo's <span class="mono">dynamo_execute_project ${esc(rs.name)}</span> ${where}, from <span class="mono">${esc(st.cwd)}</span>.</div>
+       <div class="cmdbox"><code>${esc(rs.short)}</code><button class="btn btn-sm btn-outline-light" data-copy="${esc(rs.line)}" title="copies the full command"><i class="bi bi-clipboard"></i></button></div>
+       ${why}
+       <div class="small mt-3">${unfoldStatusHTML(st)}</div>
+       <div class="small text-body-secondary mt-2">From a terminal instead (pyDynamo shell, this folder): <span class="mono">${esc(st.order || "./" + rs.name + ".exe")}</span>.</div></div>
+     <div class="cardx" id="runJob" data-active="${busy ? 1 : 0}">${runJobHTML(job)}</div>`;
 }
-// the same run as a Slurm job: the user sets how many GPUs and CPUs (and the memory), the line lists the shared
-// partitions whose machines have that many GPUs (slurm_plan) and Slurm starts the job on the first machine that has
-// them free. pyDynamo then uses what the job got: its GPUs (numbered 0..n-1 inside the job) and its CPUs.
-const SL = { project: null, n: null, gpus: null, cpus: "32", mem: "", memSet: false, plan: null, timer: null };
-function slurmGpuCount(st) {
-  const n = Math.max(1, projectGpus(st.fields.gpu_identifier_set).length);
-  if (SL.project !== st.project || SL.n !== n) {                                  // follows the project
-    if (SL.project !== st.project) SL.memSet = false;
-    SL.project = st.project; SL.n = n; SL.gpus = String(n);
-  }
-  const k = parseInt(SL.gpus, 10);
-  return Number.isFinite(k) && k > 0 ? k : n;
+function runJobHTML(job) {
+  if (!job) return `<h2><i class="bi bi-activity"></i>Last run</h2><div class="text-body-secondary small">Not run from this window yet.</div>`;
+  const local = job.mode === "local";
+  const color = job.active ? "var(--dcp-ok)" : (/FAIL|CANCEL|TIMEOUT|OUT_OF|exit status [1-9]/.test(job.state) ? "var(--dcp-bad)" : "inherit");
+  return `<h2><i class="bi bi-activity"></i>Last run <span class="hint">${local ? "process" : "Slurm job"} ${esc(job.id)}, started ${esc(job.started)}</span></h2>
+    <div class="d-flex align-items-center gap-3 flex-wrap"><span class="fw-semibold" style="color:${color}">${esc(job.state)}</span>
+      ${job.active ? `<button class="btn btn-sm btn-outline-danger" data-act="run-stop"><i class="bi bi-stop-fill me-1"></i>${local ? "Stop" : "Cancel job"}</button>` : ""}</div>
+    <div class="small mt-2">Output: <span class="mono">${esc(job.out || "")}</span> next to the project; the project's own <span class="mono">log.txt</span> is written as Dynamo writes it.${local ? "" : " <span class=\"mono\">squeue --me</span> shows the job while it waits or runs."}</div>`;
 }
-// the job's RAM (--mem, not GPU memory): pyDynamo keeps the particles in RAM during the alignment (float32, shared
-// among the GPU processes) and holds twice that while reading them; a margin of 4 GB per GPU process and 4 GB for the
-// main one. An estimate, rounded up to 8 GB; the user's own value is kept.
-function particlesGB(st) {
-  const df = st.data_facts || {}, l = df.l, N = df.N || 0;
-  const vox = Array.isArray(l) ? l.reduce((a, b) => a * b, 1) : (l ? l ** 3 : 0);
-  return N * vox * 4 / 2 ** 30;
-}
-function slurmRam(st, k) {
-  if (SL.memSet) return SL.mem;
-  return Math.max(16, Math.ceil((2 * particlesGB(st) + 4 * k + 4) / 8) * 8) + "G";
-}
-function slurmLine(st) {
-  const ids = projectGpus(st.fields.gpu_identifier_set), k = slurmGpuCount(st), name = st.project;
-  const asProject = ids.length === k && ids.every((x, i) => x === i);   // the job's GPUs are the project's 0..k-1
-  const parts = (SL.plan && SL.plan.partitions) || [];
-  const opts = [parts.length ? `--partition=${parts.join(",")}` : "", `--job-name=${name}`, `--gres=gpu:${k}`,
-    SL.cpus ? `--cpus-per-task=${SL.cpus}` : "", slurmRam(st, k) ? `--mem=${slurmRam(st, k)}` : ""].filter(Boolean).join(" ");
-  return `sbatch ${opts} --wrap "${asProject ? `./${name}.exe` : `dynamo_execute_project ${name} --gpus all`}"`;
-}
-function slurmNotes(st) {
-  const ids = projectGpus(st.fields.gpu_identifier_set), N = Math.max(1, ids.length), k = slurmGpuCount(st);
-  const plan = SL.plan || {};
-  const where = !(plan.machines || []).length
-    ? `<span class="text-danger">No machine of the shared partitions has ${k} GPUs${plan.most_gpus ? ` (at most ${plan.most_gpus} per machine)` : ""}: this job would never start.</span>`
-    : `Slurm can start it on ${esc(plan.machines.join(", "))} (${(plan.features || []).length ? esc(plan.features.join(", ")) + "; " : ""}partition${plan.partitions.length === 1 ? "" : "s"} ${esc(plan.partitions.join(", "))}), on the first that has ${k === 1 ? "a GPU" : k + " GPUs"} free. While the cluster is busy the job waits in the queue (<span class="mono">squeue --me</span> shows it PENDING; <span class="mono">squeue --me --start</span> the expected start); asking for fewer GPUs can start it sooner.`;
-  const split = k === N ? "" : k < N
-    ? `The project splits the particles into ${N} parts (Computing environment); with ${k} GPU${k === 1 ? "" : "s"} they take the parts in turn${N % k ? ", unevenly" : ""}.`
-    : `The project splits the particles into ${N} part${N === 1 ? "" : "s"} (Computing environment), so only ${N} of the ${k} GPUs would work: set ${k} there to use them all.`;
-  return `<div class="small mt-2" id="slWhere">${where}</div>${split ? `<div class="small text-warning-emphasis mt-2"><i class="bi bi-info-circle me-1"></i>${split}</div>` : ""}`;
-}
-function slurmCard(st) {
-  if (SL.plan && SL.plan.slurm === false) return `<div class="cardx"><h2><i class="bi bi-hdd-network"></i>As a Slurm job</h2><div class="small text-body-secondary">Slurm was not found on this machine (sinfo).</div></div>`;
-  const line = slurmLine(st);
-  return `<div class="cardx" id="slurmCard"><h2><i class="bi bi-hdd-network"></i>As a Slurm job <span class="hint">set what the job gets; Slurm finds the machine</span></h2>
-    <div class="row g-2 mb-3">
-      <div class="col-4 col-md-3"><label class="form-label small mb-1">GPUs</label><input class="form-control form-control-sm mono" id="slGpus" inputmode="numeric" value="${esc(SL.gpus)}"></div>
-      <div class="col-4 col-md-3"><label class="form-label small mb-1">CPU cores</label><input class="form-control form-control-sm mono" id="slCpus" inputmode="numeric" value="${esc(SL.cpus)}"></div>
-      <div class="col-4 col-md-3"><label class="form-label small mb-1" title="--mem: the job's main memory; GPU memory is not asked for">RAM (main memory)</label><input class="form-control form-control-sm mono" id="slMem" value="${esc(slurmRam(st, slurmGpuCount(st)))}"></div></div>
-    <div class="cmdbox"><code id="slLine">${esc(line)}</code><button class="btn btn-sm btn-outline-light" id="slCopy" data-copy="${esc(line)}"><i class="bi bi-clipboard"></i></button></div>
-    <div id="slNotes">${slurmNotes(st)}</div>
-    <div class="small text-body-secondary mt-3" id="slRamNote">${ramNote(st)}</div>
-    <div class="small text-body-secondary mt-2">pyDynamo uses what the job gets: the particle parts go to the job's GPUs, and the particle files are read with up to 8 of the job's CPU cores.
-      Submit it from this folder in the pyDynamo shell (<span class="mono">prototype/bin/pydynamo-shell</span>: pyDynamo's environment, no SBGrid, with Slurm's commands); the job gets that environment, and its output goes to <span class="mono">slurm-&lt;job id&gt;.out</span> here; the project's own <span class="mono">log.txt</span> is written as usual.</div></div>`;
-}
-function ramNote(st) {
-  const gb = particlesGB(st), df = st.data_facts || {};
-  const est = SL.memSet ? "" : gb ? ` The value is estimated from the data: pyDynamo keeps the ${df.N} particles in RAM during the alignment (${gb < 0.1 ? "under 0.1" : gb.toFixed(1)} GB as float32) and holds twice that while reading them, plus a margin of 4 GB per GPU process.` : "";
-  return `<b>RAM</b> is the job's main memory (<span class="mono">--mem</span>), not GPU memory: GPU memory is not asked for, because the job's GPUs are its own, whole, with all their memory.${est} Slurm may stop a job that needs more RAM than it asked for; without <span class="mono">--mem</span> it would give the job all of its machine's memory (unless the cluster sets a default with DefMemPerCPU / DefMemPerNode).`;
-}
-function slurmPaint() {
-  const line = slurmLine(S.st);
-  if (!SL.memSet && $("#slMem") && document.activeElement !== $("#slMem")) $("#slMem").value = slurmRam(S.st, slurmGpuCount(S.st));
-  if ($("#slRamNote")) $("#slRamNote").innerHTML = ramNote(S.st);
-  $("#slLine").textContent = line;
-  $("#slCopy").dataset.copy = line;
-  $("#slNotes").innerHTML = slurmNotes(S.st);
-}
-function slurmUpdate() {
-  SL.gpus = $("#slGpus") ? $("#slGpus").value.trim() : SL.gpus;
-  SL.cpus = $("#slCpus") ? $("#slCpus").value.trim() : SL.cpus;
-  if ($("#slMem") && document.activeElement === $("#slMem")) {   // typed: the user's value; cleared: the estimate again
-    SL.mem = $("#slMem").value.trim(); SL.memSet = SL.mem !== "";
-  }
-  const k = slurmGpuCount(S.st);
-  if (SL.plan && SL.plan.gpus === k) { slurmPaint(); return; }
-  slurmPaint();
-  clearTimeout(SL.timer);                          // where a k-GPU job can run: asked once the typing pauses
-  SL.timer = setTimeout(async () => {
-    const plan = await getJSON(`/api/slurm?gpus=${k}`).catch(() => null);
-    if (plan && slurmGpuCount(S.st) === k) { SL.plan = plan; if ($("#slLine")) slurmPaint(); }
-  }, 250);
+// while the Run page is shown and its last run is active, its state is read again every few seconds
+let RUN_TIMER = null;
+function runPoll() {
+  clearTimeout(RUN_TIMER);
+  RUN_TIMER = setTimeout(async () => {
+    if (S.page !== "run" || !$("#runJob")) return;
+    const r = await call("run_status");
+    if (r.ok && $("#runJob")) {
+      const was = $("#runJob").dataset.active === "1";
+      $("#runJob").innerHTML = runJobHTML(r.result);
+      $("#runJob").dataset.active = r.result && r.result.active ? "1" : "0";
+      if (was && !(r.result && r.result.active)) { await renderMain(); return; }   // ended: the Run button again
+    }
+    runPoll();
+  }, 5000);
 }
 
 /* ------------------------------------------------------------------------------------------------ dialogs */
@@ -1095,9 +1089,10 @@ document.addEventListener("keydown", async (ev) => {
   const abpRow = t.closest("[data-abp]");
   if (abpRow && t.tagName === "INPUT") { await commitAbp(abpRow); }
 });
-document.addEventListener("input", (ev) => { if (["slGpus", "slCpus", "slMem"].includes(ev.target.id)) slurmUpdate(); });
 document.addEventListener("change", async (ev) => {
   if (ev.target.id === "advSw") { S.rounds.adv = ev.target.checked; await loadRounds(); }
+  if (ev.target.id === "runSlurm") { await runSet("pydyn_slurm", ev.target.checked ? "1" : "0"); return; }
+  if (ev.target.dataset && ev.target.dataset.run) { await runSet(ev.target.dataset.run, ev.target.value); return; }
   if (ev.target.id === "fsAll") fsFilter();
 });
 
@@ -1123,6 +1118,12 @@ async function act(name) {
     }
     case "unfold": { const r = await call("unfold_and_hint"); S.lastUnfold = r.ok ? r.result : null; return renderMain(); }
     case "hmp-1": await call("environment_edit", ["how_many_processors", "1"]); return renderMain();
+    case "run-start": { await call("run_start"); return renderMain(); }
+    case "run-stop": {
+      const yes = await ask("Stop the run", "Stop the project's run now? A local run is ended, a Slurm job is cancelled (scancel); the iteration in progress is lost.");
+      if (yes) await call("run_stop");
+      return renderMain();
+    }
     case "abp_dialog": return openAbp();
     case "editor-close": return closeEditor();
     case "editor-save": {

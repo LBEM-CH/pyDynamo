@@ -115,6 +115,91 @@ def test_check_supported_refuses_bandpass_only_failures(tmp_path):
     abp.check_supported(dict(vpr, area_search_r1=np.array([0.5, 4.0, 2.0])), [1], proj)   # ceil(0.5) = 1
 
 
+def test_check_supported_refuses_masks_not_read_as_double(tmp_path):
+    """dynamo_read gives an .mrc mask the class of its own reader (dynamo_read.m:332-333), and an EM type-1
+    smoothing mask is uint8 (dynamo_read_emfile.m:96-97; double .* uint8 is uint8): both are refused before any
+    computation with NotImplementedError, not a KeyError of the EM reader after reference 2's files were rewritten.
+    So are a smoothing mask of another size and a 2-D file_mask. A missing smoothing mask is allowed
+    (getSmoothingMask.m:19-22), also the convention default 'my_smask.em' of a vpr without the field."""
+    import types
+    from pydyn import console
+    vpr = {"nref_r1": 2.0, "sym_r1": "c1", "localnc_r1": 1.0, "area_search_modus_r1": 0.0,
+           "area_search_r1": np.array([4.0, 4.0, 2.0]), "file_mask": "p/settings/mask.em"}
+    for p in D.BASIC:
+        vpr.setdefault("%s_r1" % p, 1.0)
+    src = tmp_path / "p"
+    (src / "settings").mkdir(parents=True)
+    proj = types.SimpleNamespace(name="p", source=str(src), cwd=str(tmp_path))
+    ones = np.ones((8, 8, 8), dtype=np.float32)
+    dynio.write_em(str(src / "settings" / "mask.em"), ones)
+    console.write_mrc(str(src / "settings" / "mask.mrc"), ones)
+    dynio.write_em(str(src / "settings" / "smask.em"), ones)
+    dynio.write_em(str(src / "settings" / "smask_u8.em"), ones.astype(np.uint8))
+    dynio.write_em(str(src / "settings" / "smask_small.em"), np.ones((6, 8, 8), dtype=np.float32))
+    dynio.write_em(str(src / "settings" / "mask_2d.em"), np.ones((1, 8, 8), dtype=np.float32))
+    abp.check_supported(vpr, [1], proj)                                         # no field: my_smask.em is missing
+    abp.check_supported(dict(vpr, file_mask_smoothing="p/settings/gone.em"), [1], proj)
+    abp.check_supported(dict(vpr, file_mask_smoothing=""), [1], proj)
+    abp.check_supported(dict(vpr, file_mask_smoothing="./p/settings/smask.em"), [1], proj)
+    with pytest.raises(NotImplementedError, match="file_mask '.*' that is not an EM file"):
+        abp.check_supported(dict(vpr, file_mask="p/settings/mask.mrc"), [1], proj)
+    with pytest.raises(NotImplementedError, match="file_mask_smoothing '.*' that is not an EM file"):
+        abp.check_supported(dict(vpr, file_mask_smoothing="p/settings/mask.mrc"), [1], proj)
+    with pytest.raises(NotImplementedError, match="uint8 file_mask_smoothing"):
+        abp.check_supported(dict(vpr, file_mask_smoothing="p/settings/smask_u8.em"), [1], proj)
+    with pytest.raises(NotImplementedError, match="another size"):
+        abp.check_supported(dict(vpr, file_mask_smoothing="p/settings/smask_small.em"), [1], proj)
+    with pytest.raises(NotImplementedError, match="not 3-D"):
+        abp.check_supported(dict(vpr, file_mask="p/settings/mask_2d.em"), [1], proj)
+    (tmp_path / "bad.em").write_bytes(bytes([64, 0, 0, 0]) + bytes(12))          # an MRC-like first byte
+    with pytest.raises(NotImplementedError, match="EM header"):
+        abp.check_supported(dict(vpr, file_mask="bad.em"), [1], proj)
+
+
+def test_apply_smoothing_mask_messages_and_product(tmp_path, capsys):
+    """getSmoothingMask.m:12-24: an absent field and a missing file each print Dynamo's line (o = mbs.o: no leading,
+    nothing in log.txt) and leave the volume unmasked. The vpr of adaptiveFiltering.m:122 comes from dynamo_vpr_load,
+    which adds the convention default 'my_smask.em' (dynamo_vpr_load.m:124). An existing EM mask multiplies; an .mrc
+    one is refused (its class is not double) instead of failing in the EM reader."""
+    import types
+    from pydyn import console
+    (tmp_path / "p").mkdir()
+    proj = types.SimpleNamespace(name="p", cwd=str(tmp_path), p=lambda *r: os.path.join(str(tmp_path / "p"), *r))
+    v = np.arange(64, dtype=np.float64).reshape(4, 4, 4)
+    assert abp.apply_smoothing_mask(proj, {}, v) is v
+    assert abp.apply_smoothing_mask(proj, {"file_mask_smoothing": "gone.em"}, v) is v
+    assert abp.apply_smoothing_mask(proj, {"file_mask_smoothing": ""}, v) is v
+    assert abp.apply_smoothing_mask(proj, abp._as_loaded({}), v) is v
+    assert capsys.readouterr().out.splitlines() == ["Smoothing mask parameter not defined in this project!",
+                                                    "Smoothing mask file is not existing: gone.em",
+                                                    "Smoothing mask file is not existing: ",
+                                                    "Smoothing mask file is not existing: my_smask.em"]
+    m = np.zeros((4, 4, 4), dtype=np.float32)
+    m[1:3, 1:3, 1:3] = 0.5
+    dynio.write_em(str(tmp_path / "p" / "smask.em"), m)
+    out = abp.apply_smoothing_mask(proj, {"file_mask_smoothing": "./p/smask.em"}, v)
+    assert np.array_equal(out, v * m.astype(np.float64))
+    console.write_mrc(str(tmp_path / "p" / "smask.mrc"), m)
+    with pytest.raises(NotImplementedError, match="not an EM file"):
+        abp.apply_smoothing_mask(proj, {"file_mask_smoothing": "./p/smask.mrc"}, v)
+    assert not os.path.exists(str(tmp_path / "p" / "log.txt"))
+
+
+def test_too_low_writes_dynamos_five_log_lines(tmp_path, capsys):
+    """adaptiveFiltering.m:356-364: o.error(5) prints 5 lines of 60 '#' on the screen only, then o.e(' ') twice, the
+    message, o.e(' ') twice, each with the leading 'bandpass #<ite>' on the screen and in log.txt
+    (mbparse/@output/e.m, echo.m), then error('aborting!')."""
+    import types
+    proj = types.SimpleNamespace(p=lambda *r: os.path.join(str(tmp_path), *r))
+    with pytest.raises(RuntimeError, match="^aborting!$"):
+        abp.too_low(abp._Echo(proj, 3))
+    lines = ["[bandpass #3]  ", "[bandpass #3]  ",
+             "[bandpass #3] New low pass is too low! You are killing all the frequencies!!",
+             "[bandpass #3]  ", "[bandpass #3]  "]
+    assert open(str(tmp_path / "log.txt")).read().splitlines() == lines
+    assert capsys.readouterr().out.splitlines() == ["#" * 60] * 5 + lines
+
+
 def test_fsc_shells_synthetic():
     rng = np.random.default_rng(1)
     a = rng.standard_normal((16, 16, 16))

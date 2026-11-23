@@ -116,6 +116,10 @@ def main(argv=None):
     new_kw = {dest: getattr(a, dest) for dest, _, _, _ in _NEW_OPTIONS if getattr(a, dest) is not None}
     if a.force:
         new_kw["forceOverwrite"] = 1
+    if not a.gui and not new_kw:                     # --no-gui / --gui 0 only decide what follows a creation
+        print("[pydyn dcp] --no-gui (--gui 0) applies only when creating a project (dcp --p NAME --d DATA ...): "
+              "nothing to create, the window is not opened")
+        return 2
     if not name:
         if new_kw:
             print("[pydyn dcp] give the project name: dcp --p NAME --d DATA ...")

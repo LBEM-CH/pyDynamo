@@ -108,11 +108,25 @@ without `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONUSERBASE`, `LD_LIBRA
 site. A login environment that adds its own Python, Qt 6 or CUDA libraries therefore cannot leak in. With the exact
 engine, a start-up check confirms that the Dynamo files are present before any project work.
 
-**On Slurm.** The Run page of the dcp window proposes an `sbatch` line. You set the GPUs, CPU cores and RAM. The line
-lists the shared partitions that have machines with that many GPUs (read with `sinfo`). For a job with n GPUs, it
-wraps `./NAME.exe` when the project's `gpu_identifier_set` is `0..n-1`, and `dynamo_execute_project NAME --gpus all`
-otherwise. Either way, the run uses the job's own GPUs. The particle files are read with up to 8 of the job's CPU
-cores. Submit the line from the pyDynamo shell, so that the job inherits the environment.
+**From the dcp window: this machine or Slurm.** The Computing environment page has a **Submit to Slurm** box, saved
+into the project. Unticked, the Run step runs the project on this machine's GPUs (`gpu_identifier_set`), in the
+background. Its output goes to `pydyn_NAME.out` next to the project. Ticked, the Run step submits it with `sbatch` as
+a job asking for as many GPUs as the project has, on one machine:
+- the job's CPU cores, RAM (empty: estimated from the data) and partitions (empty: the shared partitions that have
+  machines with that many GPUs, read with `sinfo`) are pyDynamo's `pydyn_slurm_cpus`, `pydyn_slurm_mem` and
+  `pydyn_slurm_partition`;
+- its time limit and the submit command are Dynamo's own `cluster_walltime` (`--time`; Dynamo's default is
+  00:10:00) and `submit_order`. Dynamo writes both into the cards, so changing them needs a new unfold;
+- inside the job the run uses the job's GPUs (`--gpus all`), and its output goes to `slurm-<job id>.out`.
+
+The Run page shows the state of the last run (`squeue`, then `sacct`) and stops it (`scancel` for a job). The last run
+of a project is recorded in `pydyn_NAME.job.json` next to it, so it is shown again when the window is reopened.
+The run is pyDynamo's `dynamo_execute_project NAME`, started with the environment's Python in a clean environment.
+The particle files are read with up to 8 of the job's CPU cores.
+
+pyDynamo's `pydyn_slurm*` fields are stored in `settings/virtual_project.mat` only while they differ from their
+defaults, so a project that never ticks the box keeps Dynamo's file as it is. Dynamo reads only the fields it knows,
+and its own dcp window does not keep these when it saves a project.
 
 `pydynamo info NAME` prints a project's rounds, iterations, next iteration, data and seeds.
 
@@ -127,10 +141,12 @@ cores. Submit the line from the pyDynamo shell, so that the job inherits the env
 **Outputs** follow Dynamo's layout in the project folder: `settings/`, `cards/`, `results/ite_XXXX/starting_values/`,
 `results/ite_XXXX/averages/`, `temp/`, `log.txt` and `next_iteration.txt`. As in Dynamo, `temp/ite_XXXX` is deleted
 at the end of each iteration's assembly.
-- `averages/` holds `refined_table`, `average`, `average_unweighted`, `fweight_average_raw`, `fmask_average` and
-  `eo_fsc`. With symmetry, it also holds `average_symmetrized` and `fmask_average_symmetrized`.
+- `averages/` holds `refined_table`, `average`, `average_unweighted`, `fweight_average_raw`, `fmask_average`,
+  `eo_fsc`, `average_symmetrized` and `fmask_average_symmetrized`. As in Dynamo, the last two are written for every
+  symmetry; for c1 they are copies of `average` and `fmask_average`.
 - The project folder contains no file that Dynamo does not write. `gpulog.txt` goes to the working folder, as Dynamo
-  writes it.
+  writes it, and so do the Run step's `pydyn_NAME.out` and `pydyn_NAME.job.json`. Only the Submit to Slurm settings
+  add fields to `settings/virtual_project.mat`, and only while they are set (see "From the dcp window").
 - pyDynamo's progress lines and timings go to stdout.
 
 ## Exactness
@@ -148,7 +164,8 @@ at the end of each iteration's assembly.
     `PYDYN_EXACT_SMS`) reproduces the order of a GPU with N streaming multiprocessors, e.g. `--exact-sms 64` for an
     RTX A5000.
   - Each particle is aligned on its own, and its orientations are processed 128 at a time (the batched path) with the
-    same bits. This path reads results back once per refinement level and runs the reductions in cuBLAS 8's order. It
+    same bits. Fewer are taken when the free GPU memory holds fewer, and an out-of-memory error halves the number;
+    the bits do not depend on it. This path reads results back once per refinement level and runs the reductions in cuBLAS 8's order. It
     uploads the rotation matrices once per level, skips the pad copy, and merges steps that are a single IEEE
     operation. The batched reductions and the merged steps are checked at start against legacy cuBLAS 8 and
     Dynamo's kernels on the GPU in use. A failed check turns that option off (the cuBLAS / per-kernel path gives the
@@ -159,7 +176,8 @@ at the end of each iteration's assembly.
 - **fast** is pyDynamo's own batched CuPy engine (real-to-complex FFTs, particle spectra kept on the GPU). It needs
   nothing from the Dynamo installation. It is close to Dynamo but not identical: float32 differences at the 7th digit
   can flip near-ties between orientations. Its batch size comes from the GPU memory balancer (`pydyn/balancer.py`),
-  which only this engine uses.
+  which only this engine uses. It refuses odd box sizes, `localnc` 0 and `use_CC` other than 0 and 1
+  (NotImplementedError).
 
 ### Averaging
 
@@ -298,7 +316,7 @@ These scripts run from a checkout. They are not installed by `pip install`. Use 
 |---|---|
 | `prototype/run_engine.py CARD [--engine] [--exact-sms N] [--batch B\|auto]` | Drop-in for Dynamo's GPU engine on one card. Run it from the folder Dynamo's engine would run in. It starts one worker per id in the card's `gpu_identifier_set`, writes `refined_gpuProcRefTable_*.btbl` and prints a JSON summary. `--shared-grid` is a fast-engine experiment that is not Dynamo-identical. |
 | `prototype/run_dynamo_project.py --source P --data D --out NEW` | Re-executes an unfolded Dynamo project into a new folder. The source is only read. It takes the engine options of `dynamo_execute_project`, plus `--table-initial` and `--progress-log`. |
-| `prototype/dev/average_test.py WORK PROJECT ITE DATA NGPUS` | Averages one iteration on the GPUs and compares the result with Dynamo's averaging outputs, bit for bit. `AVG_DUMP=file.npz` also saves the full-precision outputs. |
+| `prototype/dev/average_test.py WORK PROJECT ITE DATA NGPUS` | Averages one iteration on the GPUs as the project runner does (MATLAB thread count, the round's FSC symmetry, the pool's subranges when `matlab_workers_average` > 0) and compares the result with Dynamo's averaging outputs, bit for bit. Set `PYDYN_MATLAB_THREADS` to the core count of the node Dynamo ran on. `AVG_DUMP=file.npz` also saves the full-precision outputs. |
 | `prototype/dev/compare_tables.py A B [--truth T]` | Compares two tables (`.tbl` or `.btbl`) particle by particle and prints a JSON summary of the orientation, shift and cc differences. |
 | `prototype/bin/dcp` | The `dcp` command, run with `.envs/pydynamo`'s Python without the editable install |
 | `prototype/bin/pydynamo-shell` | A clean interactive shell with the environment active (see "The user workflow") |
@@ -339,6 +357,7 @@ PYDYN_GPU_TESTS=1 python -I -m pytest -m gpu prototype/tests    # GPU tests: opt
 | `pydyn/webui/` | The dcp window: local server (`server.py`), session API (`api.py`), Qt WebEngine window (`shell.py`), HTML view (`static/`, vendored Bootstrap 5.3.3 and Bootstrap Icons 1.11.3) |
 | `pydyn/viewers/` | `dmapview`, `dview`, `dslices`, `dtplot` and the adaptive-filtering FSC plot: display logic (`logic.py`) and Qt windows (`qtview.py`), each viewer in its own process |
 | `pydyn/execute.py` | `dynamo_execute_project`: destination and GPU checks, then runs the project in place |
+| `pydyn/launch.py` | The Run step of the dcp window: this machine's GPUs or a Slurm job (`pydyn_slurm*` fields, the `sbatch` line, `sinfo` partitions, run state, stop) |
 | `pydyn/dynproject.py` | `DynamoProject`: the iteration loop (setup, GPU workers, assembly, averaging, propagation), `validate`, columns 27-30 |
 | `pydyn/engine.py` | The alignment engine: mode selection and start-up check, and the `fast` batched CuPy engine |
 | `pydyn/dynamo_exact.py` | The `exact` engine: Dynamo 1.1.514's PTX, cuFFT 8, cuBLAS 8, the batched path and its self-checks |

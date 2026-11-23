@@ -13,9 +13,12 @@ Arrays are [z, y, x] (x fastest, EM order).
 
 Engine(..., exact=True) selects the EXACT mode instead (pydyn/dynamo_exact.py): Dynamo 1.1.514's own kernels (its
 PTX), cuFFT 8 and legacy cuBLAS 8 in Dynamo's order, one particle at a time and its orientations in batches of
-`batch` (EXACT_BATCH for "auto"; 1 = Dynamo's own loop) with the same bits, so that the refined tables equal the
-official engine's bit for bit on the same GPU model. The mode is chosen by `exact`, or, when `exact` is None, by the
-environment variable PYDYN_ENGINE=exact|fast (default: DEFAULT_ENGINE).
+`batch` (EXACT_BATCH for "auto", fewer when the GPU memory holds fewer; 1 = Dynamo's own loop) with the same bits, so
+that the refined tables equal the official engine's bit for bit on the same GPU model. The mode is chosen by `exact`,
+or, when `exact` is None, by the environment variable PYDYN_ENGINE=exact|fast (default: DEFAULT_ENGINE).
+
+The fast mode refuses (NotImplementedError) what it does not reproduce: odd box sizes, localnc 0, use_CC other than
+0 and 1 (check_fast_supported).
 """
 import os
 import time
@@ -136,7 +139,13 @@ void roseman(float* res, const float* nnz, const float* sig, const long N, const
 _kernels = {}
 ENGINE_MODES = ("exact", "fast")
 DEFAULT_ENGINE = "exact"        # the user requires Dynamo's results (benchmarks/09_engine_parity/exact: bit-identical)
-EXACT_BATCH = 128             # orientations per step of the exact engine when batch="auto" (1 = Dynamo's own loop)
+EXACT_BATCH = 128             # orientations per step of the exact engine when batch="auto" (1 = Dynamo's own loop),
+                              # at most what the free GPU memory holds (dynamo_exact.batch_for_memory)
+# Dynamo's results of a refinement level in which no orientation beats -1 (spp.cu:3961-3976, written at 4597-4614)
+NO_PEAK_CC, NO_PEAK_ANGLES, NO_PEAK_POS = -1.0, (-1001.0, -1002.0, -1003.0), (-4001.0, -4002.0, -4003.0)
+# area_search_modus cases of Dynamo's switch (spp.cu:4355-4413); any other value has no case: no limit
+LIMIT_AT_CENTER = (1, 11, 5, 51)                      # origin n/2 (4363-4367, 4390-4394)
+LIMIT_AT_SHIFT = (2, 21, 3, 31, 4, 41, 6, 61)         # origin int(n/2 + previous shift) (4379-4388, 4396-4401)
 
 
 def engine_mode(mode=None):
@@ -156,6 +165,18 @@ def preflight(mode=None):
         from . import dynamo_exact
         dynamo_exact.preflight()
     return m
+
+
+def check_fast_supported(card, n):
+    """NotImplementedError for what the fast engine does not reproduce (the exact engine runs Dynamo's code)."""
+    if n % 2:
+        raise NotImplementedError("fast engine: odd box sizes (Dynamo's rawpeak2space, spp.cu:3433-3450, and its "
+                                  "folding x >= n/2 -> n - x of the full spectrum, spp.cu:536-547, differ from the "
+                                  "half-spectrum arithmetic of this engine for odd n)")
+    if int(getattr(card, "localnc", 1)) != 1:
+        raise NotImplementedError("fast engine: only localnc=1 (spp.cu:4100-4112, 4331-4342)")
+    if int(card.use_CC) not in (0, 1):
+        raise NotImplementedError("fast engine: use_CC=2 (rotated tfmask, spp.cu:4250-4292) is not implemented")
 
 
 def _k(name):
@@ -295,6 +316,7 @@ class Engine:
             sms = exact_sms if exact_sms is not None else int(os.environ.get("PYDYN_EXACT_SMS", "0") or 0)
             self._ex = DynamoExact(template, mask, card, powf=self.powf, batch=b, sdot_sms=sms or None)
             return
+        check_fast_supported(card, n)
         s = np.float32(card.shrink)
         self.H = cp.asarray(bandpass_half(n, s * card.high, s * card.low, 3 * s))
         self.T = cp.asarray(np.ascontiguousarray(template, dtype=np.float32))
@@ -349,6 +371,7 @@ class Engine:
         t0 = time.perf_counter()
         n, P = self.n, len(particles)
         self.particles_host = particles            # [P, n, n, n] float32 (host)
+        self.target_pairs = int(target_pairs)      # also the pairs per step of align_shared with batch="auto"
         if self.exact:                             # Dynamo streams one particle at a time (spp.cu:2127-2146)
             self.chunk = P
             self.residency = {"particles": P, "engine": "exact", "resident_per_chunk": 1}
@@ -413,7 +436,7 @@ class Engine:
     def _space_coords(self):
         n = self.n
         r = cp.arange(n)
-        return (n // 2 - r) % n  # rawpeak2space for ns == nl
+        return (n // 2 - r) % n  # rawpeak2space for ns == nl and even n (odd n: check_fast_supported)
 
     def align_pairs(self, pidx, angles, lim_origin=None, lim_matrix=None):
         """Score every (particle, orientation) pair. Returns host arrays: cc, space[3], neighbours[6] per pair."""
@@ -507,8 +530,9 @@ class Engine:
 
         if self.batch == "auto":
             if self.balancer is None:
-                self.balancer = MemoryBalancer(log=self.balance_log)
-                self.balancer.calibrate(run, npairs)
+                bal = MemoryBalancer(log=self.balance_log)
+                bal.calibrate(run, npairs)
+                self.balancer = bal                # only once calibrated (a failed calibration leaves no batch)
             self.balancer.run_all(run, npairs)
         else:
             for b0 in range(0, npairs, int(self.batch)):
@@ -554,7 +578,8 @@ class Engine:
         best_sp = cp.zeros((P, 3), dtype=cp.int64)
         best_nb = cp.zeros((P, 6), dtype=cp.float32)
         groups = [np.nonzero(self.widx == w)[0] for w in range(self.HW.shape[0])]
-        ptile = max(1, self.batch // otile)
+        pairs = self.target_pairs if self.batch == "auto" else int(self.batch)   # auto: prepare_particles' reserve
+        ptile = max(1, pairs // otile)
         for o0 in range(0, O, otile):
             t0 = time.perf_counter()
             o1 = min(O, o0 + otile)
@@ -579,6 +604,8 @@ class Engine:
                     p = cp.argmax(af, axis=1)
                     ar = cp.arange(B)
                     ccv = (f1[ar, p] - 1).reshape(Ot, Pt)
+                    # spp.cu:4562 strict '<' from -1: only values > -1 compete, a NaN never does
+                    ccv = cp.where(ccv > np.float32(-1), ccv, np.float32(-np.inf))
                     k = cp.argmax(ccv, axis=0)                                   # first best orientation in tile
                     kb = k * Pt + cp.arange(Pt)
                     cbest = ccv[k, cp.arange(Pt)]
@@ -667,9 +694,13 @@ class Engine:
         return out
 
     def _refine(self, rows):
-        """Refinement of the particles whose spectra are loaded (rows correspond to self.loaded)."""
+        """Refinement of the particles whose spectra are loaded (rows correspond to self.loaded).
+        Per level and particle, as Dynamo's align() (and DynamoExact.refine_particle): the first strict maximum among
+        the orientations whose cc is > -1 (a NaN never compares true, spp.cu:4562), else Dynamo's defaults
+        (NO_PEAK_*, spp.cu:3961-3976), which are written and seed the next level as well (4597-4614)."""
         card = self.card
         P, n = len(rows), self.n
+        check_fast_supported(card, n)                            # the card may have been replaced since __init__
         s = np.float32(card.shrink)
         seeds = rows[:, 6:9].astype(np.float32).copy()
         shifts = (rows[:, 3:6] * s).astype(np.float32)
@@ -686,12 +717,13 @@ class Engine:
                 bo, bc, bs, bn = self.align_shared(common)
                 new_seeds, new_shifts = seeds.copy(), shifts.copy()
                 for p in range(P):
-                    if bo[p] < 0:
-                        continue
-                    pos = [float(bs[p, a]) + subpixel_spline(bn[p, 2 * a], bc[p], bn[p, 2 * a + 1], self.powf) for a in range(3)]
-                    new_seeds[p] = common[bo[p]]
+                    if bo[p] < 0:                                  # no orientation beat -1: Dynamo's defaults
+                        new_seeds[p], pos, best_cc[p] = NO_PEAK_ANGLES, NO_PEAK_POS, NO_PEAK_CC
+                    else:
+                        pos = [float(bs[p, a]) + subpixel_spline(bn[p, 2 * a], bc[p], bn[p, 2 * a + 1], self.powf) for a in range(3)]
+                        new_seeds[p] = common[bo[p]]
+                        best_cc[p] = bc[p]
                     new_shifts[p] = np.array(pos, dtype=np.float32) - np.float32(n / 2)
-                    best_cc[p] = bc[p]
                 seeds, shifts = new_seeds, new_shifts
                 rng.shrink(card.refine_factor)
                 rng.cone_flip = int(card.cone_flip > 1)
@@ -704,25 +736,27 @@ class Engine:
             self.orientation_counts.append(int(counts.sum()))
             pidx = np.repeat(np.arange(P), counts)
             allang = np.concatenate(sets, axis=0)
-            if card.area_search_modus in (1, 11, 5, 51):
+            if card.area_search_modus in LIMIT_AT_CENTER:
                 origin = np.full((P, 3), n // 2, dtype=np.float32)
-            else:
+            elif card.area_search_modus in LIMIT_AT_SHIFT:
                 origin = np.trunc(n / 2 + shifts).astype(np.float32)
+            else:                                                 # 0, or a value without a case: no limit
+                origin = None
             cc, spc, nb = self.align_pairs(pidx, allang, origin, lim_matrix)
             starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
             new_seeds, new_shifts = seeds.copy(), shifts.copy()
             for p in range(P):
                 c = cc[starts[p]:starts[p] + counts[p]]
-                if counts[p] == 0:
-                    continue
-                k = int(np.argmax(c))
-                if not (c[k] > np.float32(-1)):                   # Dynamo: best starts at -1, strict '<'
-                    continue
-                j = starts[p] + k
-                pos = [float(spc[j, a]) + subpixel_spline(nb[j, 2 * a], c[k], nb[j, 2 * a + 1], self.powf) for a in range(3)]
-                new_seeds[p] = allang[j]
-                new_shifts[p] = np.array(pos, dtype=np.float32) - np.float32(n / 2)
-                best_cc[p] = c[k]
+                valid = c > np.float32(-1)                        # Dynamo: best starts at -1, strict '<'
+                if valid.any():
+                    k = int(np.argmax(np.where(valid, c, np.float32(-np.inf))))   # first maximum
+                    j = starts[p] + k
+                    pos = [float(spc[j, a]) + subpixel_spline(nb[j, 2 * a], c[k], nb[j, 2 * a + 1], self.powf) for a in range(3)]
+                    new_seeds[p] = allang[j]
+                    best_cc[p] = c[k]
+                else:
+                    new_seeds[p], pos, best_cc[p] = NO_PEAK_ANGLES, NO_PEAK_POS, NO_PEAK_CC
+                new_shifts[p] = np.array(pos, dtype=np.float32) - np.float32(n / 2)   # spp.cu:4597-4599
             seeds, shifts = new_seeds, new_shifts
             rng.shrink(card.refine_factor)
             rng.cone_flip = int(card.cone_flip > 1)

@@ -301,6 +301,18 @@ def test_returning_control_and_stdout_split():
     assert D.stdout_to_log_lines("a\nb\n ") == ["a", "b", " "]
 
 
+def test_gpu_failure_lines():
+    """dynamo_pipeline_system_check_output_gpu.m:44-57, appended at :90 for the order of dynamo_execute_project.m:297
+    (sprintf('%s %s',myMotor,cardfile)); sprintf('%s \\n', order) gives the order line and an empty line, as
+    dynamo_aux_appendlog writes fprintf('%s\\n') per element."""
+    order = "dynamo_compute_iteration_spp " + D.card_iteref_path("p", 1, 1)
+    assert order == "dynamo_compute_iteration_spp ./p/cards/ite_0001/card_iteref_ref_001_ite_0001.card"
+    assert D.gpu_failure_lines(order) == ["&" * 63] * 8 + [
+        "GPU: Warning!!!",
+        "something went wrong inside the GPU application while the system tried to execute the order:",
+        order + " ", "", "Dynamo will abort project execution at this point."] + ["&" * 62] * 8
+
+
 def test_append_log(tmp_path):
     D.append_log(str(tmp_path), ["x", " "])
     D.append_log(str(tmp_path), ["y"])

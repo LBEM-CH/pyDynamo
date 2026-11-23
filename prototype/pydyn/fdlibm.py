@@ -77,6 +77,11 @@ _INVPIO2 = 6.36619772367581382433e-01
 _PIO2_1, _PIO2_1T = 1.57079632673412561417e+00, 6.07710050650619224932e-11
 _PIO2_2, _PIO2_2T = 6.07710050630396597660e-11, 2.02226624879595063154e-21
 _PIO2_3, _PIO2_3T = 2.02226624871116645580e-21, 8.47842766036889956997e-32
+# npio2_hw[k]: high word of (k+1)*pi/2
+_NPIO2_HW = (0x3FF921FB, 0x400921FB, 0x4012D97C, 0x401921FB, 0x401F6A7A, 0x4022D97C, 0x4025FDBB, 0x402921FB,
+             0x402C463A, 0x402F6A7A, 0x4031475C, 0x4032D97C, 0x40346B9C, 0x4035FDBB, 0x40378FDB, 0x403921FB,
+             0x403AB41B, 0x403C463A, 0x403DD85A, 0x403F6A7A, 0x40407E4C, 0x4041475C, 0x4042106C, 0x4042D97C,
+             0x4043A28C, 0x40446B9C, 0x404534AC, 0x4045FDBB, 0x4046C6CB, 0x40478FDB, 0x404858EB, 0x404921FB)
 
 
 def _rem_pio2(x):
@@ -106,10 +111,11 @@ def _rem_pio2(x):
         n = int(t * _INVPIO2 + 0.5)
         fn = float(n)
         r = t - fn * _PIO2_1
-        w = fn * _PIO2_1T
+        w = fn * _PIO2_1T                                      # 1st round good to 85 bits
         j = ix >> 20
         y0 = r - w
-        if j - ((_hi(y0) >> 20) & 0x7ff) > 16:                 # second iteration, good to 118 bits
+        quick = n < 32 and ix != _NPIO2_HW[n - 1]              # quick check: no cancellation (n >= 1 here)
+        if not quick and j - ((_hi(y0) >> 20) & 0x7ff) > 16:   # second iteration, good to 118 bits
             t = r
             w = fn * _PIO2_2
             r = t - w

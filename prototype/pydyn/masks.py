@@ -4,10 +4,10 @@ S = /programs/x86_64-linux/dynamo/1.1.514/matlab/src. Spec: docs/analysis/10b_ab
 
 Ported (bit for bit, checked against headless Dynamo 1.1.514 and the user's abp_align/settings/editorMask.em):
 
-* dynamo_blob(l, fwhm)                      S/dynamo_blob.m:60-85 (with MATLAB's exp: matlab_exp)
+* dynamo_blob(l, fwhm)                      S/dynamo_blob.m:59-85 (with MATLAB's exp: matlab_exp)
 * dynamo_cylinder(radii, size, [], 0)        S/dynamo_cylinder.m:61-122 (centred, no smoothing)
-* dynamo_mollify(vol, hwhm)                  S/dynamo_mollify.m:107-113 + maprange.m
-* dynamo_mask('size',..,'type','cylinder', 'r'|'radius'|'sx'|'sy', 'height'|'h', 'gaussian', 'invert')
+* dynamo_mollify(vol, hwhm)                  S/dynamo_mollify.m:107-113 + maprange.m (hwhm 1 or 3 values)
+* dynamo_mask('size',..,'type','cylinder', 'r'|'radius'|'sx'|'sy'|'r1', 'height'|'h', 'gaussian', 'invert')
                                              S/dynamo_mask.m:262-575
 * MaskEditor: the state of the dynamo_mask_GUI window and its "save" button (read_mask_settings,
   createAndSaveMask, S/dynamo_mask_GUI.m:104-210,291-390).
@@ -35,8 +35,10 @@ MATLAB library is used), otherwise scipy.fft with a printed warning. `fft_backen
 (S/shorthands): dmask = dynamo_mask, dmollify = dynamo_mollify, dcylinder = dynamo_cylinder.
 
 Not ported (NotImplementedError): mask types other than 'cylinder' (sphere, ellipsoid, tube, shell, blob,
-missing_wedge, missing_pyramid), 'smooth', 'band', 'fwhm', 'eulers', 'shifts', 'position', 'tilt', 'thick',
-'r1'/'r2', 'sz', 'for', merges and 'ws'.
+missing_wedge, missing_pyramid), and a non-empty 'band', 'eulers', 'shifts', 'position', 'for', merges or 'ws'.
+A cylinder does not read 'smooth' (S/dynamo_mask.m:484 sets it to 0), 'fwhm', 'tilt', 'sz', 'r2' or 'thick', and
+'r1' only stands in for 'r' (:358-360), so these are accepted; 'nfig' is never read. An empty value ([], as the
+editor passes for a ticked radio button with an empty box) is the parameter not given, as Dynamo's isempty tests.
 """
 import ctypes
 import ctypes.util
@@ -535,6 +537,7 @@ _INVLN2 = 1.44269504088896338700e+00
 _HALF = np.array([0.5, -0.5])
 _P1, _P2, _P3, _P4, _P5 = (1.66666666666666019037e-01, -2.77777777770155933842e-03, 6.61375632143793436117e-05,
                            -1.65339022054652515390e-06, 4.13813679705723846039e-08)
+_O_THRESHOLD, _U_THRESHOLD = 7.09782712893383973096e+02, -7.45133219101941108420e+02
 
 # matlab_exp is ported from fdlibm's e_exp.c:
 # Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
@@ -544,13 +547,20 @@ _P1, _P2, _P3, _P4, _P5 = (1.66666666666666019037e-01, -2.77777777770155933842e-
 def matlab_exp(x):
     """exp as MATLAB R2019a computes it (fdlibm e_exp.c, no FMA), vectorised.
     Bit-identical to MATLAB on all 262,144 arguments of dynamo_blob(64, 6) (k4_blob_dump.m); numpy / glibc exp
-    differ there by +-1 ulp in 24,518 values. |x| >= 709.78 (overflow / underflow branch) is not ported."""
+    differ there by +-1 ulp in 24,518 values. |x| >= 709.78 is e_exp.c's filter: NaN -> x+x, exp(+-inf) = {inf, 0},
+    x > o_threshold -> huge*huge (inf), x < u_threshold -> twom1000*twom1000 (0); the rest of that range takes the
+    reduction below, where e_exp.c's k < -1021 scaling (y*2^(k+1000))*2^-1000 is the one rounding of ldexp(y, k)
+    into the subnormal range (e.g. the corners of dynamo_blob(128, 6), arguments down to -946)."""
     x = np.asarray(x, dtype=np.float64)
     hxs = (x.view(np.uint64) >> np.uint64(32)).astype(np.int64)
     xsb = (hxs >> 31) & 1
     hx = hxs & 0x7fffffff
-    if np.any(hx >= 0x40862E42):
-        raise NotImplementedError("matlab_exp: |x| >= 709.78 (fdlibm overflow / underflow branch) is not ported")
+    filt = hx >= 0x40862E42                             # if |x| >= 709.78...
+    nan = filt & np.isnan(x)
+    over = filt & (x > _O_THRESHOLD)                    # overflow, and exp(+inf) = +inf
+    under = filt & (x < _U_THRESHOLD)                   # underflow, and exp(-inf) = 0
+    x_in = x
+    x = np.where(nan | over | under, 0.0, x)            # those return above; keep the reduction finite there
     k = np.zeros(x.shape, dtype=np.int64)
     hi = x.copy()
     lo = np.zeros_like(x)
@@ -574,6 +584,10 @@ def matlab_exp(x):
     y1 = np.ldexp(y1, k)
     out = np.where(k == 0, y0, y1)
     out = np.where(tiny, 1.0 + x, out)
+    xn = np.where(nan, x_in, 0.0)
+    out = np.where(nan, xn + xn, out)                   # NaN: x+x
+    out = np.where(over, np.inf, out)
+    out = np.where(under, 0.0, out)
     return out
 
 # ===================================================================================================== geometry
@@ -587,6 +601,8 @@ def _size3(my_size):
 def dynamo_blob(l, fwhm):
     """S/dynamo_blob.m: exp(-x1^2-x2^2-x3^2) on the grid -l/2:l/2-1 (even l), x_i = i/sqrt(2 c^2),
     c = fwhm/2.35482. Returned as [z, y, x] (x1 is the first MATLAB index = last axis here)."""
+    if fwhm is None or np.size(fwhm) == 0:              # set_default_or_empty('fwhm',l/3) :59
+        fwhm = int(l) / 3
     fw = np.ravel(np.asarray(fwhm, dtype=float))
     if fw.size == 2:
         raise ValueError("Please give just one value or three [x,y,z] for the fwmh parameter")
@@ -636,7 +652,8 @@ def dynamo_cylinder(radii, my_size, position=None, smoothing_pixels=0):
 
 def dynamo_mollify(volume, hwhm=None):
     """S/dynamo_mollify.m:107-113 (3-D, useMatlab false): blob of FWHM 2*hwhm, circular FFT convolution, then
-    maprange to [min(volume), max(volume)]. There is no default for hwhm: dynamo_mollify.m:67 is
+    maprange to [min(volume), max(volume)]. hwhm*2 is elementwise: 3 values give dynamo_blob a width per axis
+    [x, y, z], 2 values are its error (dynamo_blob.m:60-62). There is no default for hwhm: dynamo_mollify.m:67 is
     set_default('fwhm',3), a different variable, so Dynamo fails at hwhm*2 (:107) with "Undefined function or
     variable 'hwhm'" when it is not given; so does this function."""
     if hwhm is None:
@@ -645,7 +662,7 @@ def dynamo_mollify(volume, hwhm=None):
     v = np.asarray(volume, dtype=np.float64)
     if v.ndim != 3:
         raise NotImplementedError("dynamo_mollify of a 2-D image (imgaussfilt)")
-    blob = dynamo_blob(v.shape[0], 2 * float(hwhm))
+    blob = dynamo_blob(v.shape[0], 2 * np.ravel(np.asarray(hwhm, dtype=float)))     # hwhm*2 :107
     f = _filter_local(v, blob)
     return maprange(f, v.min(), v.max())
 
@@ -660,7 +677,20 @@ def maprange(x, a=0.0, b=1.0):
 
 # ===================================================================================================== dynamo_mask
 _UNPORTED = ("smooth", "band", "fwhm", "eulers", "shifts", "position", "tilt", "thick", "r1", "r2", "sz", "for",
-             "merge_with", "mw", "or", "subtract_from", "sf", "ws", "nfig")
+             "merge_with", "mw", "or", "subtract_from", "sf", "ws")       # 'nfig' is declared (:191), never read
+# not read by the cylinder case: q.smooth=0 (:484); tilt only in :516-524, fwhm :508-512, sz :480, r2 and thick
+# :489-502; r1 only stands in for r (:358-360) (their errors of :395 and :405 are kept in dynamo_mask)
+_NOT_READ_BY_CYLINDER = ("smooth", "fwhm", "tilt", "sz", "r1", "r2", "thick")
+
+
+def _empty(v):
+    """MATLAB isempty of a parameter as passed: None (not given), '' or an array of no elements. dynamo__str2num
+    (:272) keeps a char that is not a number, so a non-empty char stays non-empty."""
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v == ""
+    return np.size(v) == 0
 
 
 def _num(v):
@@ -693,23 +723,28 @@ def _size_argument(raw):
 
 def dynamo_mask(*args, **kw):
     """dynamo_mask(...) (S/dynamo_mask.m) for 'type','cylinder'. Arguments as Dynamo's name/value pairs, as
-    positional pairs or keywords: size, type, r (or radius), sx, sy, height (or h), gaussian, invert, o (output
-    file). Returns the mask as a float64 [z, y, x] array (None where Dynamo prints and returns empty)."""
+    positional pairs or keywords: size, type, r (or radius), sx, sy, r1, height (or h), gaussian, invert, o
+    (output file); an empty value ([]) is the parameter not given, as Dynamo's isempty tests. Returns the mask as a
+    float64 [z, y, x] array (None where Dynamo prints and returns empty)."""
     if len(args) % 2:
         raise TypeError("dynamo_mask takes name/value pairs")
     q = {}
     for k, v in list(zip(args[0::2], args[1::2])) + list(kw.items()):
         q[str(k).lstrip("-")] = v                        # dynamo__parse_remove_minus
-    if "radius" in q and q.get("r") is None:             # dynamo__parse_short2real(q,'radius','r') :262
-        q["r"] = q.pop("radius")
-    if "h" in q and q.get("height") is None:             # :263
-        q["height"] = q.pop("h")
-    for k in _UNPORTED:
-        if k in q and q[k] is not None and not (k == "smooth" and np.all(_num(q[k]) == 0)):
-            raise NotImplementedError("dynamo_mask parameter %r is not ported" % k)
+    if not _empty(q.get("radius")):                      # dynamo__parse_short2real(q,'radius','r') :262
+        q["r"] = q["radius"]
+    if not _empty(q.get("h")):                           # :263
+        q["height"] = q["h"]
     mtype = q.get("type")
+    for k in _UNPORTED:
+        if _empty(q.get(k)) or (mtype == "cylinder" and k in _NOT_READ_BY_CYLINDER):
+            continue
+        if not (k == "smooth" and np.all(_num(q[k]) == 0)):
+            raise NotImplementedError("dynamo_mask parameter %r is not ported" % k)
     size = _size_argument(q.get("size"))
     invert = q.get("invert")
+    if _empty(invert):                                   # if q.invert (:572) of [] is false
+        invert = False
     invert = bool(invert) if not isinstance(invert, str) else invert.strip().lower() in ("1", "true", "yes", "on")
     if size is None:
         print("Mask needs a size, aborting.")
@@ -722,22 +757,31 @@ def dynamo_mask(*args, **kw):
     if mtype != "cylinder":
         raise NotImplementedError("dynamo_mask type %r (only 'cylinder' is ported)" % (mtype,))
     nx = size[0]
-    r, sx, sy = _num(q.get("r")), _num(q.get("sx")), _num(q.get("sy"))
+    r, sx, sy, r1 = _num(q.get("r")), _num(q.get("sx")), _num(q.get("sy")), _num(q.get("r1"))
     height, gaussian = _num(q.get("height")), _num(q.get("gaussian"))
-    if r is None and sx is None:                         # :350-352 (r1 is not ported)
+    if r is None and sx is None and r1 is None:          # :350-352
         r = np.array([np.floor(nx / 2)])
-    if r is None and sx is not None:
+    if r is None and sx is not None:                     # :354-356
         r = sx
+    if r is None and r1 is not None:                     # :358-360
+        r = r1
     if sx is None and sy is None:                        # :363-366
         sx, sy = r, r
     if sx is not None and sy is None:
         sy = sx
     if height is None:                                   # :384-386 sets q.heigh (sic), then :416-418
         height = np.array([np.floor(nx / 2)])
+    # :388-406 do not change a cylinder; their one effect is MATLAB's error for vectors of unequal lengths in
+    # q.r1+q.thick and q.r2-q.r1, which NumPy's broadcasting raises alike (ValueError)
+    r1 = r if r1 is None else r1                         # :388-390
+    r2, thick = _num(q.get("r2")), _num(q.get("thick"))
+    if r2 is None:                                       # :392-400 (q.thickess=2, sic, when thick is empty)
+        r2 = r1 + (2 if thick is None else thick)
+    np.subtract(r2, r1)                                  # :403-406 q.thick=q.r2-q.r1
     mask = dynamo_cylinder([sx[0], sy[0], height[0] / 2], size, None, 0)     # :483-485 (q.smooth = 0)
     mask = np.nan_to_num(mask, nan=0.0)                  # dynamo_nan(mask,0) :541
-    if gaussian is not None:                             # :564-566
-        mask = dynamo_mollify(mask, gaussian[0])
+    if gaussian is not None:                             # :564-566, the whole vector (dynamo_mollify)
+        mask = dynamo_mollify(mask, gaussian)
     if invert:                                           # :572-574
         mask = -mask + np.ones(mask.shape)
     if q.get("o"):

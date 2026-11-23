@@ -374,3 +374,88 @@ def test_viewer_functions_are_exported():
               "dynamo_tableplot"):
         assert n in pydyn.__all__
 
+
+# ------------------------------------------------------------------------------------------------ dvcheck sizes, unfold copy
+_ROUNDS_EMPTY = 'Apparently all the rounds are empty: no iterations are executed. Check the "ite" parameter'
+
+
+def _fresh_project(tmp_path, monkeypatch, name="p"):
+    """dcp.new with default masks on synthetic 64^3 data (test_stage3 run A): its dvcheck reports only
+    _ROUNDS_EMPTY (warning ite_r1)."""
+    from pydyn import dcp, vpr as V
+    from test_stage3 import make_data
+    monkeypatch.chdir(tmp_path)
+    make_data(str(tmp_path))
+    dcp.new(name, "d", "filamentsData_ctf", "template", "raw_template_ctf.em", "masks", "default",
+            "t", "particles_edit_mod.tbl", "gui", 0)
+    return V.load(name, verbose=False)
+
+
+def test_dvcheck_reports_a_size_left_nan(tmp_path, monkeypatch):
+    """dynamo_vpr_check.m:632/647/697/910 test sizes with ~=, and NaN ~= x is true in MATLAB: a file that is missing
+    keeps its NaN size (dynamo_vpr_statistics.m:68-80, :169-174) and is reported, sprintf('%d', NaN) = 'NaN'."""
+    from pydyn import vprcheck
+    v = _fresh_project(tmp_path, monkeypatch)
+    r = vprcheck.check(dict(v, file_mask_smoothing="my_smask.em"), 0)          # check 1 does not test this field
+    assert r.report == [_ROUNDS_EMPTY, "Smoothing FSC Mask has size NaN, reference has size 64. Please check "]
+    assert (r.fields_warning, r.fields_error, r.warning_state) == (
+        ["ite_r1", "file_mask_smoothing", "file_template_initial"], [], "warning")
+    r = vprcheck.check(dict(v, file_fmask_initial="missing_fmask.em"), 0)
+    assert r.report == ['ATTENTION on parameter "file_fmask_initial"',
+                        "   file/folder that defines the initial count of fourier components does not seem to exist.",
+                        '   Apparent current value in project: "missing_fmask.em".', _ROUNDS_EMPTY,
+                        "fmask has size NaN, reference has size 64. Please check "]
+    assert r.fields_warning == ["ite_r1"]
+    assert r.fields_error == ["file_fmask_initial", "folder_data", "file_fmask_initial"]
+    r = vprcheck.check(dict(v, file_template_initial="missing_template.em", localnc_r1=0.0, localnc_r2=0.0), 0)
+    localnc = ('reference size (NaN) differs from particle size (64). This is not allowed when "localnc" is set to '
+               "zero (as in round %d). Please check. ")
+    assert r.report == ['ATTENTION on parameter "file_template_initial"',
+                        "   file/folder with the initial template does not seem to exist.",
+                        '   Apparent current value in project: "missing_template.em".', _ROUNDS_EMPTY,
+                        "Mask has size 64, reference has size NaN. Please check ",
+                        "Smoothing FSC Mask has size 64, reference has size NaN. Please check ",
+                        localnc % 1, localnc % 2,
+                        "fmask has size 64, reference has size NaN. Please check "]
+    assert r.fields_warning == ["ite_r1", "file_mask", "file_template_initial", "file_mask_smoothing",
+                                "file_template_initial"]
+    assert r.fields_error == ["file_template_initial", "folder_data", "file_template_initial",   # check 14: errors{1},
+                              "folder_data", "file_fmask_initial"]                                # {2} once per call
+
+
+def test_copyfile_of_a_file_onto_itself(tmp_path, monkeypatch, capsys):
+    """dynamo_copyfile.m:117-123 skips equal strings only; the same file under another spelling reaches copyfile,
+    which returns success 0, and Dynamo prints its lines and goes on (:170-177) instead of failing."""
+    from pydyn import vpr as V
+    monkeypatch.chdir(tmp_path)
+    os.makedirs(os.path.join("p", "settings"))
+    dynio.write_em("p/settings/mask.em", np.ones((4, 4, 4), np.float32))
+    before = open("p/settings/mask.em", "rb").read()
+    V._copyfile("./p/settings/mask.em", "./p/settings/mask.em", True)          # strcmp: nothing to do
+    assert capsys.readouterr().out == ""
+    absolute = os.path.join(str(tmp_path), "p", "settings", "mask.em")
+    for src in ("p/settings/mask.em", absolute):
+        V._copyfile(src, "./p/settings/mask.em", True)
+        assert capsys.readouterr().out.splitlines() == [
+            "[dcopyfile] Error copying %s into ./p/settings/mask.em" % src,
+            "Cannot copy or move a file or directory onto itself.", " "]
+        assert open("p/settings/mask.em", "rb").read() == before
+    V._copyfile("p/settings/mask.em", "./p/settings/other.em", True)           # another file: copied, silent
+    assert open("p/settings/other.em", "rb").read() == before and capsys.readouterr().out == ""
+
+
+def test_unfold_with_a_seed_spelled_as_its_database_file(tmp_path, monkeypatch, capsys):
+    """file_mask 'p/settings/mask.em' (as the dcp file chooser gives it) is ./p/settings/mask.em: links2settings
+    goes on, and unfold ends as for the fresh project (all rounds empty, test_stage3 run A)."""
+    from pydyn import vpr as V
+    v = _fresh_project(tmp_path, monkeypatch)
+    before = open("p/settings/mask.em", "rb").read()
+    capsys.readouterr()
+    assert V.unfold(dict(v, file_mask="p/settings/mask.em"), verbose=False) == (None, "error")
+    out = capsys.readouterr().out.splitlines()
+    i = out.index("[dcopyfile] Error copying p/settings/mask.em into ./p/settings/mask.em")
+    assert out[i + 1:i + 3] == ["Cannot copy or move a file or directory onto itself.", " "]
+    assert open("p/settings/mask.em", "rb").read() == before
+    assert os.path.isfile("p/settings/template_initial_ref_001.em")          # the later copies were made
+    assert open("p/next_iteration.txt").read() == "1\n"
+

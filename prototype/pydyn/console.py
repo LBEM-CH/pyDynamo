@@ -74,9 +74,11 @@ def _o_error5(lines):
 
 
 def dread(file_name, tolerance_level=0, fmt=None):
-    """dread(f): .tbl/.txt/... -> float64 (complex if a token is complex) [rows, cols]; .em/.sem/.btbl -> float64
-    [z, y, x] (uint8 for EM type 1); .mrc mode 2 -> float32; line files -> list of str; .card -> dict;
-    an existing file without extension -> dynamo_vpr_load. A missing file raises (tolerance 0) or returns None
+    """dread(f): .tbl/.txt/... -> float64 (complex if a token is complex) [rows, cols]; .em/.sem -> float64
+    [z, y, x] (uint8 for EM type 1); .btbl -> the table [rows, cols] (nx rows, ny columns: MATLAB's nx x ny matrix of
+    dynamo_read_emfile), [z, y, x] if it has nz > 1; .mrc mode 2 -> float32; line files -> list of str; .card ->
+    dict; an existing file without extension -> dynamo_vpr_load. fmt replaces the extension, without its dots
+    (dynamo_read.m:270-271). A missing file raises (tolerance 0) or returns None
     (tolerance 1); a folder raises as in Dynamo (dynamo_read.m:212-266: "no policy defined for this type of folder",
     the output is never assigned), also for a project folder: use pydyn.vpr.load for a project."""
     if isinstance(file_name, (list, tuple)):
@@ -100,16 +102,24 @@ def dread(file_name, tolerance_level=0, fmt=None):
             return None
         _o_error5(["Error in dynamo_read", "Missing file!!!", "  * missing file detected: %s" % file_name])
         raise DynamoError('[dread: error] cannot find requested file "%s"' % file_name)
-    ext = fmt if fmt else os.path.splitext(file_name)[1].lstrip(".")
-    if ext == "":                                    # :274-279, an existing file without extension
-        from . import vpr
-        return vpr.load(file_name)
+    if fmt:
+        ext = fmt.replace(".", "")                   # :270-271: strrep(my_format,'.','')
+    else:
+        ext = os.path.splitext(file_name)[1].lstrip(".")
+        if ext == "":                                # :274-279, an existing file without extension
+            from . import vpr
+            return vpr.load(file_name)
     if ext in _TEXT_TABLE:
         try:
             return dynio.read_dlm(file_name)
         except Exception:
             return np.zeros((0, 0))                  # dynamo_read.m:317-324: any exception -> []
-    if ext in ("em", "sem", "btbl"):
+    if ext == "btbl":
+        v = dynio.read_em(file_name)                 # :329-330, dynamo_read_emfile: reshape(data, nx, ny, nz)
+        if v.shape[0] == 1:                          # nz = 1: the nx x ny matrix, i.e. the table [rows, cols]
+            return np.ascontiguousarray(v[0].T)
+        return v
+    if ext in ("em", "sem"):
         return dynio.read_em(file_name)
     if ext in ("mrc", "map", "rec", "ali", "st", "mrcs", "preali"):
         return read_mrc(file_name)
@@ -133,6 +143,10 @@ def dwrite(obj, file_name):
         a = np.asarray(obj)
         if a.dtype == bool:
             a = a.astype(np.float32)
+        if ext == "btbl" and a.ndim <= 2:
+            # a table [rows, cols] (a 1-D array: one row, as a MATLAB row vector): dynamo_write_em_simple.m:60,92-94
+            # writes size(T) = rows, cols, 1 as nx, ny, nz and T column-major, i.e. the [z, y, x] volume T.T[None]
+            a = np.ascontiguousarray(a.reshape(1, -1).T if a.ndim < 2 else a.T)[None]
         dynio.write_em(file_name, a)
     elif ext in ("mrc", "rec", "ali", "mrcs"):
         write_mrc(file_name, obj)

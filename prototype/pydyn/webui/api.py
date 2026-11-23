@@ -28,7 +28,8 @@ ACTIONS = frozenset((
 ))
 VIEW_ACTIONS = frozenset(("masks_closed", "editor_open", "editor_save", "editor_show", "editor_view", "editor_slices",
                           "editor_load", "use_gpus",
-                          "unfold_and_hint", "run_hint"))
+                          "unfold_and_hint", "run_hint",
+                          "run_settings", "run_set", "run_start", "run_status", "run_stop"))
 # runtime fields shown by the view (main window and the step windows)
 FIELDS = ("name_project", "folder_data", "file_table_initial", "file_template_initial", "file_mask",
           "file_mask_classification", "file_fmask_initial", "file_mask_smoothing", "destination", "gpu_identifier_set",
@@ -108,9 +109,34 @@ def _tiles(out, vols, axis, k):
     return out
 
 
+def _mask_log_dir():
+    """The folder of the mask editor's logs: pydyn's per-user cache ($PYDYN_CACHE_DIR, else $XDG_CACHE_HOME/pydyn or
+    ~/.cache/pydyn, as pydyn.dynamo_exact), subfolder mask_logs. Not the project: Dynamo's mask editor writes the mask
+    only (dynamo_mask_GUI.m:385 dynamo_write(mask,file_output)), so the project folder holds Dynamo's files only."""
+    base = os.environ.get("PYDYN_CACHE_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "pydyn")
+    return os.path.join(base, "mask_logs")
+
+
 def mask_log_path(mask_file):
-    """The log of a mask made in the mask editor: the mask's file name + '.log', next to it."""
-    return str(mask_file) + ".log"
+    """The log pydyn writes for a mask made in the mask editor: in _mask_log_dir, named after the mask's real path
+    (its file name + a hash of the path)."""
+    import hashlib
+    real = os.path.realpath(str(mask_file))
+    return os.path.join(_mask_log_dir(), "%s.%s.log" % (os.path.basename(real),
+                                                         hashlib.sha1(os.fsencode(real)).hexdigest()[:16]))
+
+
+def find_mask_log(mask_file):
+    """The log to read for `mask_file`: the one in the cache (mask_log_path), else '<mask>.log' next to the mask (a
+    log carried with a copied mask, or written there by earlier pydyn versions; only read, never written). None
+    without one."""
+    if not mask_file:
+        return None
+    for p in (mask_log_path(mask_file), str(mask_file) + ".log"):
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def _md5(path):
@@ -123,19 +149,21 @@ def _md5(path):
 
 
 def write_mask_log(mask_file, settings):
-    """Write (overwrite) the log of the settings that created `mask_file`: plain 'name = value' lines, only the
-    ticked settings, and the mask's md5 so a later change of the mask can be told."""
+    """Write (overwrite) the log of the settings that created `mask_file` (at mask_log_path, outside the project):
+    plain 'name = value' lines, only the ticked settings, and the mask's md5 so a later change of the mask can be
+    told."""
     from ..masks import GUI_RADIO_SETTINGS
     lines = ["# pyDynamo mask editor: the settings that created %s (Create mask, %s)"
              % (os.path.basename(mask_file), time.strftime("%d-%b-%Y %H:%M:%S")),
              "# Loading this mask in the mask editor fills in these settings; the next Create mask overwrites this file.",
-             "file = %s" % mask_file, "md5 = %s" % _md5(mask_file), "type = %s" % settings.get("type", ""),
-             "size = %s" % str(settings.get("size") or "").strip()]
+             "file = %s" % os.path.realpath(str(mask_file)), "md5 = %s" % _md5(mask_file),
+             "type = %s" % settings.get("type", ""), "size = %s" % str(settings.get("size") or "").strip()]
     for p in GUI_RADIO_SETTINGS:
         if (settings.get("radio") or {}).get(p):
             lines.append("%s = %s" % (p, str((settings.get("edit") or {}).get(p, "")).strip()))
     lines.append("invert = %d" % int(bool(settings.get("invert"))))
     p = mask_log_path(mask_file)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
     tmp = p + ".%d.tmp" % os.getpid()
     with open(tmp, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -143,11 +171,11 @@ def write_mask_log(mask_file, settings):
 
 
 def read_mask_log(mask_file):
-    """The settings in the log next to `mask_file`, or None without one. 'matches': the mask is still the one the
-    log was written for (same md5); 'created': the time in its header; 'log': its path."""
+    """The settings in the log of `mask_file` (find_mask_log), or None without one. 'matches': the mask is still the
+    one the log was written for (same md5); 'created': the time in its header; 'log': its path."""
     from ..masks import GUI_RADIO_SETTINGS
-    p = mask_log_path(mask_file)
-    if not (mask_file and os.path.isfile(p)):
+    p = find_mask_log(mask_file)
+    if p is None:
         return None
     kv, created = {}, None
     with open(p) as f:
@@ -172,87 +200,8 @@ def _settings_text(rec):
                                                      for q in on] + (["inverted"] if rec.get("invert") else []))
 
 
-SLURM_CACHE_S = 30
-_SINFO = {"t": 0.0, "parts": []}
-
-
-def parse_sinfo(text):
-    """`sinfo -h -N -o "%N|%P|%a|%G|%f"` (one line per machine and partition) -> partitions: name, default, up,
-    nodes, node_gpus {machine: GPUs}, node_features {machine: [...]}, gpus (the most one machine has), features (Slurm's node features; on this
-    cluster the GPU generation, e.g. Ampere)."""
-    parts = {}
-    for line in text.splitlines():
-        f = line.strip().split("|")
-        if len(f) != 5:
-            continue
-        node, name, avail, gres, feats = f
-        default = name.endswith("*")
-        name = name.rstrip("*")
-        gpus = 0
-        for g in gres.split(","):                     # gpu:4, gpu:a40:4, gpu:4(S:0-1)
-            g = g.split("(")[0]
-            if g.startswith("gpu"):
-                try:
-                    gpus = max(gpus, int(g.split(":")[-1]))
-                except ValueError:
-                    pass
-        p = parts.setdefault(name, {"name": name, "default": False, "up": avail == "up", "nodes": [],
-                                    "node_gpus": {}, "node_features": {}, "gpus": 0, "features": []})
-        p["default"] = p["default"] or default
-        if node not in p["node_gpus"]:
-            p["nodes"].append(node)
-        p["node_gpus"][node] = gpus
-        p["node_features"][node] = [x for x in feats.split(",") if x and x != "(null)"]
-        p["gpus"] = max(p["gpus"], gpus)
-        p["features"] += [x for x in feats.split(",") if x and x != "(null)" and x not in p["features"]]
-    return list(parts.values())
-
-
-def slurm_partitions():
-    """The cluster's partitions (parse_sinfo), read with sinfo at most every SLURM_CACHE_S seconds. Slurm's
-    commands may sit outside PATH (here /usr/local/slurm/bin)."""
-    import shutil
-    import subprocess
-    import time
-    if time.time() - _SINFO["t"] < SLURM_CACHE_S:
-        return _SINFO["parts"]
-    sinfo = shutil.which("sinfo") or ("/usr/local/slurm/bin/sinfo" if os.access("/usr/local/slurm/bin/sinfo", os.X_OK)
-                                      else None)
-    parts = []
-    if sinfo:
-        try:
-            r = subprocess.run([sinfo, "-h", "-N", "-o", "%N|%P|%a|%G|%f"], capture_output=True, text=True, timeout=8)
-            parts = parse_sinfo(r.stdout)
-        except (OSError, subprocess.SubprocessError):
-            parts = []
-    _SINFO.update(t=time.time(), parts=parts)
-    return parts
-
-
-def slurm_plan(parts, n):
-    """Where a job asking for n GPUs on one machine can run: the shared partitions (those spanning several machines)
-    that have machines with n GPUs, one partition per set of machines (e.g. a general
-    partition and program-specific ones over the same machines: the general one is kept, its name has "gpu"). sbatch takes them as
-    a list and starts the job in whichever offers the earliest start (sbatch --partition). Partitions of a single
-    machine are left out: the job goes to the shared pool, not to one chosen machine."""
-    shared = [p for p in parts if p["up"] and len(p["nodes"]) > 1 and p["gpus"] >= n]
-    shared.sort(key=lambda p: (-len(p["nodes"]), "gpu" not in p["name"], p["name"]))
-    chosen = []
-    for p in shared:
-        if not any(set(p["nodes"]) <= set(q["nodes"]) for q in chosen):
-            chosen.append(p)
-    machines = []
-    for p in chosen:
-        machines += [m for m in p["nodes"] if p["node_gpus"].get(m, 0) >= n and m not in machines]
-    feats = []
-    for p in chosen:
-        for m in p["nodes"]:
-            if p["node_gpus"].get(m, 0) >= n:
-                feats += [x for x in p["node_features"].get(m, []) if x not in feats]
-    most = max((p["gpus"] for p in parts if p["up"]), default=0)
-    return {"slurm": bool(parts), "gpus": n, "partitions": [p["name"] for p in chosen],
-            "machines": [m.split(".")[0] for m in machines], "features": feats, "most_gpus": most,
-            "default": next((p["name"] for p in parts if p["default"]), None)}
+# Slurm's partitions and where a job can run: pydyn.launch (also the Run step's local / Slurm runs)
+from ..launch import SLURM_CACHE_S, parse_sinfo, slurm_partitions, slurm_plan   # noqa: E402,F401
 
 
 import socket as _socket
@@ -626,7 +575,7 @@ class Session:
                 "invert": bool(ed.radio.get("invert")), "save_file": f, "box": box, "file": file,
                 "exists": exists, "saved_at": time.strftime("%d-%b-%Y %H:%M", time.localtime(os.stat(f).st_mtime))
                 if exists else None, "source": self._ed_source,
-                "log": mask_log_path(f) if f and os.path.isfile(mask_log_path(f)) else None,
+                "log": find_mask_log(f),
                 "log_matches": self._ed_log_matches}
 
     def _editor_settings(self, form):
@@ -686,8 +635,8 @@ class Session:
 
     def _v_editor_load(self, path):
         """Load an existing mask file into the editor: it becomes the editor's file (shown, transferable). With a
-        log next to it (written by Create mask), its settings fill the editor; without one they are cleared and the
-        view shows the file itself."""
+        log (find_mask_log: written by Create mask, or carried next to the mask), its settings fill the editor;
+        without one they are cleared and the view shows the file itself."""
         self._need_editor()
         path = str(path).strip()
         if not os.path.isfile(path):
@@ -774,3 +723,77 @@ class Session:
         if order:
             self._echo("Execution order: %s  (run it from a terminal in %s)" % (order, os.getcwd()), "b")
         return {"order": order, "cwd": os.getcwd()}
+
+    # ------------------------------------------------------------------------------------------------ run (pydyn)
+    # The Run step runs the project where its computing parameters say (pydyn.launch): pydyn_slurm 0 on this
+    # machine's GPUs, 1 as a Slurm job.
+    def _need_project(self):
+        from ..vpr import DynamoError
+        if self.c.name is None:
+            raise DynamoError("No project is open")
+
+    def _v_run_settings(self):
+        """Where and how the Run step runs the open project (launch.describe), the state of its last run, and
+        whether the project is unfolded with its current parameters."""
+        from .. import launch
+        self._need_project()
+        d = launch.describe(self.c.get_vpr(), self.c.name, self.c.data_facts)
+        d["status"] = launch.status(self.c.name)
+        d["unfold"] = self._unfold_info()
+        return d
+
+    def _v_run_set(self, name, value):
+        """A computing parameter of the Run step: pyDynamo's (launch.PARAMS) or Dynamo's cluster_walltime /
+        submit_order. pyDynamo's are not in the cards, so a project unfolded before stays unfolded; Dynamo's two are
+        (card_ite), so changing them needs a new unfold, as in Dynamo."""
+        from .. import launch
+        self._need_project()
+        if name in launch.PARAMS:
+            info = self._unfold_info()
+            c = self.c.pydyn_edit(name, value)
+            if c.ok and info and info["current"]:
+                self._unfold_ok_until[self.c.name] = self._vpr_mtime(self.c.name)
+            return c
+        if name in ("cluster_walltime", "submit_order"):
+            return self.c.environment_edit(name, value)
+        raise ApiError("%s is not a parameter of the Run step" % name)
+
+    def _v_run_start(self):
+        """Run the project (launch.start): on this machine's GPUs or as a Slurm job. Only an unfolded project whose
+        parameters did not change since its unfold."""
+        from .. import launch
+        self._need_project()
+        info = self._unfold_info()
+        try:
+            if not info or not info["current"]:
+                raise launch.LaunchError("Unfold the project first: the Run step runs the unfolded project, and its "
+                                         "parameters changed after the last unfold" if info else
+                                         "Unfold the project first: the Run step runs the unfolded project")
+            job = launch.start(self.c.get_vpr(), self.c.name, self.c.data_facts)
+        except launch.LaunchError as e:
+            self._echo(str(e), "r")
+            return {"started": False, "error": str(e)}
+        if job["mode"] == "local":
+            self._echo("[pyDynamo] %s runs on this machine's GPUs (process %s); its output goes to %s"
+                       % (self.c.name, job["id"], job["out"]), "b")
+        else:
+            self._echo("[pyDynamo] %s submitted to Slurm: job %s (%s); its output goes to %s"
+                       % (self.c.name, job["id"], job["state"], job["out"]), "b")
+        return {"started": True, "job": job}
+
+    def _v_run_status(self):
+        from .. import launch
+        self._need_project()
+        return launch.status(self.c.name)
+
+    def _v_run_stop(self):
+        from .. import launch
+        self._need_project()
+        try:
+            st = launch.stop(self.c.name)
+        except launch.LaunchError as e:
+            self._echo(str(e), "r")
+            return None
+        self._echo("[pyDynamo] %s: %s %s stopped" % (self.c.name, "process" if st["mode"] == "local" else "Slurm job",
+                                                     st["id"]), "b")
+        return st

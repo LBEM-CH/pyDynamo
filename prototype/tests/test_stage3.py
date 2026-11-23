@@ -357,6 +357,47 @@ def test_dread_dwrite_roundtrips(tmp_path):
         dwrite(v, str(tmp_path / "v.spi"))
 
 
+def test_dread_dwrite_btbl_is_a_table(tmp_path):
+    """dwrite(T, 'x.btbl'): dynamo_write_em_simple.m:60,92-94 writes size(T) = rows, columns, 1 as nx, ny, nz and T
+    column-major (dynio.write_btbl's bytes); dread gives the table back (dynamo_read_emfile.m: reshape(nx, ny, nz)),
+    so the console paths that take a table file read a .btbl as they read a .tbl."""
+    from pydyn import dread, dwrite, dtrandomize_azimuth, rng
+    T = np.arange(6.0).reshape(2, 3)
+    f = str(tmp_path / "x.btbl")
+    dwrite(T, f)
+    b = open(f, "rb").read()
+    assert np.frombuffer(b[4:16], "<u4").tolist() == [2, 3, 1]
+    assert np.frombuffer(b[512:], "<f4").tolist() == [0, 3, 1, 4, 2, 5]             # column-major
+    dynio.write_btbl(str(tmp_path / "y.btbl"), T)
+    assert open(tmp_path / "y.btbl", "rb").read() == b
+    assert dread(f).shape == (2, 3) and np.array_equal(dread(f), T) and np.array_equal(dynio.read_btbl(f), T)
+    dwrite(np.array([1.0, 2.0, 3.0]), str(tmp_path / "v.btbl"))                      # a row vector: 1 x 3
+    assert np.frombuffer(open(tmp_path / "v.btbl", "rb").read()[4:16], "<u4").tolist() == [1, 3, 1]
+    assert np.array_equal(dread(str(tmp_path / "v.btbl")), [[1.0, 2.0, 3.0]])
+    vol = np.random.RandomState(0).randn(2, 3, 4).astype(np.float32)                 # nz > 1: a volume [z, y, x]
+    dwrite(vol, str(tmp_path / "w.btbl"))
+    assert np.array_equal(dread(str(tmp_path / "w.btbl")), vol)
+    T42 = np.arange(4 * 42, dtype=float).reshape(4, 42)
+    dwrite(T42, str(tmp_path / "t.btbl"))
+    rng("default")
+    assert dtrandomize_azimuth(str(tmp_path / "t.btbl")).shape == (4, 42)
+    dwrite(dread(str(tmp_path / "t.btbl")), str(tmp_path / "t.tbl"))                 # vpr._copyfile, .btbl -> .tbl
+    assert np.array_equal(dread(str(tmp_path / "t.tbl")), T42)
+
+
+def test_dread_format_drops_dots(tmp_path):
+    """dynamo_read.m:270-271: extension = strrep(my_format,'.',''), so '.em' and 'em' both read EM; a format given
+    for a file without extension is used (no project load)."""
+    from pydyn import dread
+    v = np.arange(8, dtype=np.float32).reshape(2, 2, 2)
+    for name in ("particle.dat", "noext"):
+        dynio.write_em(str(tmp_path / name), v)
+        for fmt in (".em", "em"):
+            assert np.array_equal(dread(str(tmp_path / name), 0, fmt), v)
+    with pytest.raises(NotImplementedError):
+        dread(str(tmp_path / "particle.dat"), 0, "spi")
+
+
 @pytest.mark.skipif(not os.path.isfile(os.path.join(REF, "console", "work", "gt_p1.mrc")), reason="ground truth absent")
 def test_dwrite_reference_files(tmp_path):
     from pydyn import dread, dwrite

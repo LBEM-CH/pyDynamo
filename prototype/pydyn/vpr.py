@@ -816,7 +816,7 @@ dvput = put
 # =====================================================================================================================
 
 def _copyfile(src, dst, read_and_write_if_ext_mismatch=False, log=None):
-    """dynamo_copyfile.m:73-171. MATLAB copyfile keeps the mtime (copy2). Deviation (08a 6.1, 11.2): a symlinked
+    """dynamo_copyfile.m:73-201. MATLAB copyfile keeps the mtime (copy2). Deviation (08a 6.1, 11.2): a symlinked
     source is copied by content (Dynamo copies the link itself and later writes through it)."""
     if not os.path.isfile(src):
         print("Sorry, file %s could not be located. Desisting copyfile for this one" % src)
@@ -827,6 +827,15 @@ def _copyfile(src, dst, read_and_write_if_ext_mismatch=False, log=None):
     if read_and_write_if_ext_mismatch and os.path.splitext(src)[1] != os.path.splitext(dst)[1]:
         from .console import dread, dwrite
         dwrite(dread(src), dst)
+        return
+    if os.path.exists(dst) and os.path.samefile(src, dst):
+        # one file under two spellings (p/settings/mask.em, ./p/settings/mask.em, an absolute path): with output
+        # arguments MATLAB's copyfile does not throw, it returns success 0 and its message (MCR 9.6
+        # resources/MATLAB/en/FILE.xml, SourceAndDestinationSame); Dynamo prints them and goes on (:170-177)
+        # [UNC: that copyfile resolves both spellings to one file is not in the source; to confirm in a run]
+        print("[dcopyfile] Error copying %s into %s" % (src, dst))
+        print("Cannot copy or move a file or directory onto itself.")
+        print(" ")
         return
     if os.path.islink(src):
         print("[pydyn] %s is a symbolic link: copying its content (Dynamo 1.1.514 would copy the link)" % src)

@@ -338,3 +338,231 @@ def test_average_chains_one_state_through_the_workers_in_ascending_tag_order(mon
     assert sum((c[2] for c in calls), []) == [0, 1, 0, 1, 0, 1, 0, 1, 0]      # odd/even by position
     assert [c[3] for c in calls] == [0, 1, 2, 3, 4] and state["k"] == 5      # each run gets the previous state
     assert nh == [5.0, 4.0]
+
+
+# ------------------------------------------------------------------ GPU workers, failure paths and the driver loop
+
+class _Proc:
+    """Stand-in for a worker process: it ends on None (unless stuck) or when terminated."""
+
+    def __init__(self, stuck=False):
+        self.alive, self.stuck, self.got_none, self.terminated = True, stuck, False, False
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.terminated, self.alive = True, False
+
+    def join(self, timeout=None):
+        if self.got_none and not self.stuck:
+            self.alive = False
+
+
+class _Conn:
+    """Parent end of a worker pipe; `reply` is the worker's answer, None for a worker still busy (never answers)."""
+
+    def __init__(self, proc, reply):
+        self.proc, self.reply, self.sent = proc, reply, []
+
+    def send(self, m):
+        self.sent.append(m)
+        if m is None:
+            self.proc.got_none = True
+
+    def recv(self):
+        assert self.reply is not None, "the reply of a busy worker must not be awaited"
+        return self.reply
+
+
+def _workers(*replies, stuck=()):
+    out = []
+    for k, rep in enumerate(replies):
+        p = _Proc(stuck=k in stuck)
+        out.append((k, _Conn(p, rep), p))
+    return out
+
+
+def test_worker_devices_are_cut_to_the_gpu_chunks():
+    """setup_gpu makes how_many_processors * len(gpu_identifier_set) chunks per reference and compute() deals them over
+    the workers: a device beyond that number would get an empty chunk list (np.concatenate([]) in the worker)."""
+    assert dp.worker_devices([0, 1], [0]) == [0]
+    assert dp.worker_devices([0, 0], [0], 1) == [0]
+    assert dp.worker_devices([2, 3, 4, 5, 6], [0, 1], 1.0) == [2, 3]
+    assert dp.worker_devices([5], [0, 1, 2, 3]) == [5]
+    assert dp.worker_devices(None, [0, 1, 2, 3]) == [0, 1, 2, 3]
+    assert dp.worker_devices([0, 1, 2, 3], [0, 1], 2) == [0, 1, 2, 3]
+
+
+def test_dynamoproject_starts_no_worker_without_a_gpu_chunk(tmp_path, monkeypatch):
+    """DynamoProject(gpus=[0, 1]) on a project with gpu_identifier_set 0 (one chunk per reference) uses device 0 only;
+    a list not longer than the chunk count is kept as given."""
+    import pydyn.symmetry as Y
+    v = base_vpr(1)
+    v["gpu_identifier_set"], v["file_table_initial"] = 0, "t.tbl"
+    monkeypatch.setattr(dp, "load_vpr", lambda path: dict(v))
+    monkeypatch.setattr(dp.DynamoProject, "validate", lambda self: None)
+    monkeypatch.setattr(dp.DynamoProject, "_data_info", lambda self: {})
+    devs = []
+    monkeypatch.setattr(Y, "set_device", lambda d: devs.append(d))
+    monkeypatch.delenv("PYDYN_REPORT", raising=False)
+    mk = lambda gpus: dp.DynamoProject(str(tmp_path / "src"), str(tmp_path / "data"), str(tmp_path / "out"),
+                                       gpus=gpus, echo=False, engine="fast", matlab_threads=1)
+    pr = mk([0, 1])
+    assert pr.gpus == [0] and pr.report["gpus"] == [0] and devs == [0]
+    v["gpu_identifier_set"] = np.array([0, 1, 2, 3], dtype=np.uint8)
+    assert mk([4, 5]).gpus == [4, 5] and mk(None).gpus == [0, 1, 2, 3]
+
+
+def test_close_terminates_workers_still_busy_after_a_failure(tmp_path):
+    """_ask_all raises on the first failed reply; the workers whose reply was not read may still be aligning and are
+    terminated by close(). An idle worker ends on None; one still alive after the join timeout is terminated."""
+    pr = bare_project(tmp_path, base_vpr())
+    pr.workers = _workers({"ok": False, "error": "out of memory"}, None, {"ok": True})
+    w = list(pr.workers)
+    with pytest.raises(RuntimeError, match="device 0 failed"):
+        pr._ask_all([{"op": "align"}] * 3)
+    pr.close()
+    assert pr.workers == []
+    assert not w[0][2].terminated and not w[0][2].alive and w[0][1].sent[-1] is None
+    assert w[1][2].terminated and None not in w[1][1].sent
+    assert w[2][2].terminated                                       # its reply was not read either
+    pr.workers = _workers({"ok": True}, {"ok": True}, stuck=(1,))
+    w = list(pr.workers)
+    assert len(pr._ask_all([{"op": "tags"}] * 2)) == 2
+    pr.close()
+    assert not w[0][2].terminated and not w[0][2].alive
+    assert w[1][2].terminated and w[1][1].sent[-1] is None
+
+
+def test_failed_engine_run_appends_dynamo_gpu_warning_block(tmp_path):
+    """dynamo_pipeline_system_check_output_gpu.m:40-92: a failed engine run appends the warning block with the order
+    (dynamo_execute_project.m:296-297), then the run stops; no engine stdout, gpulog.txt or 'Returning control'."""
+    pr = bare_project(tmp_path / "p", base_vpr())
+    pr._start_workers = lambda: None
+    pr.workers = _workers({"ok": False, "error": "Error: could not open input file"})
+    chunks = [{"ref": 1, "gpu": 0, "n": 1, "particle_list": "pl", "starting_btbl": "s", "refined_btbl": "r"}]
+    with pytest.raises(RuntimeError):
+        pr.compute(1, [1], chunks)
+    order = "dynamo_compute_iteration_spp ./p/cards/ite_0001/card_iteref_ref_001_ite_0001.card"
+    assert (tmp_path / "p" / "log.txt").read_text().split("\n")[:-1] == ["&" * 63] * 8 + [
+        "GPU: Warning!!!",
+        "something went wrong inside the GPU application while the system tried to execute the order:",
+        order + " ", "", "Dynamo will abort project execution at this point."] + ["&" * 62] * 8
+    assert not (tmp_path / "gpulog.txt").exists()
+
+
+def _assemble_project(tmp_path, nref):
+    """A bare project whose assemble() runs from the averaging on (gather, compare and threshold stubbed out)."""
+    v = base_vpr(1)
+    for r in range(1, 9):
+        v["nref_r%d" % r] = nref
+    pr = bare_project(tmp_path, v)
+    pr.log, pr.keep_temp = (lambda m: None), False
+    dynio.write_card(pr.f_card_ite(1), {"nref": nref, "time_start_computation": "01-Jan-2026 00:00:00"})
+    dynio.write_txt(pr.p("next_iteration.txt"), 1)
+    pr.gather_table = lambda ite, ref: None
+    pr.compare_table = lambda ite, ref: {}
+    pr.threshold_table = lambda ite, ref: {}
+    for ref in range(1, nref + 1):
+        dynio.write_tbl(pr.f_av("refined_table", ref, 1, "tbl"), np.ones((2, 35)))
+    return pr
+
+
+def _average_out(n, value):
+    return {"average": np.full((n, n, n), value), "average_unweighted": np.full((n, n, n), value),
+            "fmask_average": np.ones((n, n, n)), "fweight_average_raw": np.ones((n, n, n)), "eo_fsc": np.ones(n)}
+
+
+HEAD = ["[assemble] Gathering refined tables.", "[assemble] Computing table comparisons against previous iteration.",
+        "[assemble] getting rid of overlapping particles:", "[assemble] Applying  thresholding:"]
+
+
+def test_failed_average_logs_its_line_before_the_fatal_block_and_symmetrizes_nothing(tmp_path):
+    """dynamo_iteration_assemble.m:343-355: the 'Computing average for ref' echo comes before the ok test, so a NaN
+    average (pipeline/average.m ok = false) has its line before fatal_error's block. The symmetrized averages come from
+    a later loop (:457-479), so a failure in reference 2 leaves none of reference 1."""
+    pr = _assemble_project(tmp_path, 2)
+    outs = {1: _average_out(4, 0.5), 2: _average_out(4, np.nan)}
+    pr.average_from_table = lambda ite, ref, table, fsc_sym=None: outs[ref]
+    with pytest.raises(dp.FatalIterationError):
+        pr.assemble(1, [1, 2])
+    assert (tmp_path / "log.txt").read_text().split("\n")[:-1] == HEAD + [
+        "[assemble] Computing average for 2 multireference channels.",
+        "[assemble] Computing average for ref 1 ite 1",
+        "[assemble] Computing average for ref 1 ite 2",
+        " FATAL ERROR DETECTED IN ITERATION 1",
+        "   reason: [assemble] did create apparently valid table files, but it failed while using them  for averaging",
+        "   Deactivating subsequent rounds."]
+    assert dynio.read_txt(pr.p("next_iteration.txt")).ravel().tolist() == [pr.N + 1]
+    assert os.path.exists(pr.f_av("average", 1, 1)) and not os.path.exists(pr.f_av("average", 2, 1))
+    assert not os.path.exists(pr.f_av("average_symmetrized", 1, 1))
+    assert not os.path.exists(pr.f_av("fmask_average_symmetrized", 1, 1))
+
+
+def test_assemble_symmetrizes_after_every_average_and_the_done_line(tmp_path, monkeypatch):
+    """Success path of the split loops: the per-reference lines, then the 'done' line; the c1 symmetrized files are
+    byte copies of the averages (06b 8)."""
+    pr = _assemble_project(tmp_path, 2)
+    monkeypatch.setattr(dp, "load_vpr", lambda path: pr.vpr)          # the adaptive bandpass test reads settings/
+    outs = {1: _average_out(4, 0.5), 2: _average_out(4, 0.25)}
+    pr.average_from_table = lambda ite, ref, table, fsc_sym=None: outs[ref]
+    pr.assemble(1, [1, 2])
+    log = (tmp_path / "log.txt").read_text().split("\n")[:-1]
+    assert log[:7] == HEAD + ["[assemble] Computing average for 2 multireference channels.",
+                              "[assemble] Computing average for ref 1 ite 1", "[assemble] Computing average for ref 1 ite 2"]
+    assert re.fullmatch(r"done assembling intermediate average in \d+\.\d{6} seconds\. ", log[7])
+    for ref in (1, 2):
+        for k in ("average", "fmask_average"):
+            assert open(pr.f_av(k + "_symmetrized", ref, 1), "rb").read() == open(pr.f_av(k, ref, 1), "rb").read()
+    assert dynio.read_txt(pr.p("next_iteration.txt")).ravel().tolist() == [2]
+
+
+def test_empty_average_selection_is_dynamos_matlab_error_not_a_fatal_block(tmp_path):
+    """genericInput2Average.m:298-301 returns before its output 'flags' is assigned (:316), which pipeline/average.m:100
+    requests: MATLAB stops with an error. No 'Computing average for ref' line, no fatal_error block, next_iteration.txt
+    unchanged (the iteration can be run again)."""
+    pr = _assemble_project(tmp_path, 1)
+    T = np.zeros((3, 35))
+    T[:, 0], T[:, 1] = [1, 2, 3], 1                                   # aligned, none marked in column 3
+    dynio.write_tbl(pr.f_av("refined_table", 1, 1, "tbl"), T)
+    with pytest.raises(RuntimeError) as e:
+        pr.assemble(1, [1])
+    assert not isinstance(e.value, dp.FatalIterationError)
+    log = (tmp_path / "log.txt").read_text().split("\n")[:-1]
+    assert log == HEAD + ["[assemble] Computing average for 1 multireference channels."]
+    assert dynio.read_txt(pr.p("next_iteration.txt")).ravel().tolist() == [1]
+
+
+def test_check_fatal_error_returns_and_the_run_ends_normally(tmp_path):
+    """dynamo_iteration_check.m:106, :118-149: fatal_error writes next_iteration = N + 1 and its block and returns;
+    the next pass of dynamo_execute_project.m finds next_iteration > N and returns (:144-147), without an error."""
+    pr = bare_project(tmp_path, base_vpr(1))                          # 2 iterations
+    pr.log = lambda m: None
+    pr.workers, pr.report, pr.report_path, pr.gpus = [], {"iterations": []}, None, [0]
+    pr.initialize = lambda: None
+    dynio.write_txt(pr.p("next_iteration.txt"), 1)
+    for ite in (1, 2):
+        dynio.write_card(pr.f_card_ite(ite), {"nref": 1})
+    calls = []
+    pr.setup = lambda ite: calls.append(ite) or ([1], [])
+    pr.compute = lambda ite, refs, chunks: []
+
+    def assemble(ite, refs):                                          # no averages: the check finds them missing
+        dynio.write_txt(pr.p("next_iteration.txt"), ite + 1)
+        pr.set_surviving_refs(ite + 1, refs)
+        return {}
+    pr.assemble = assemble
+    rep = pr.run()
+    assert calls == [1]
+    assert [it["ite"] for it in rep["iterations"]] == [1] and rep["iterations"][0]["fatal"] is True
+    assert dynio.read_txt(pr.p("next_iteration.txt")).ravel().tolist() == [pr.N + 1]
+    bars = ["%" * 59] * 6
+    assert (tmp_path / "log.txt").read_text().split("\n")[:-1] == [" "] + bars + [
+        " ", " FATAL ERROR DETECTED IN ITERATION 1", '   reason: database item "fmask_average", ite:1, ref:1  ',
+        "   Deactivating all subsequent iterations.", " "] + bars
+    dynio.write_tbl(pr.f_av("refined_table", 1, 1, "tbl"), np.ones((2, 35)))
+    for k in ("average", "fmask_average"):
+        dynio.write_em(pr.f_av(k, 1, 1), np.ones((2, 2, 2)))
+    assert pr.check(1) is True
+    assert (tmp_path / "log.txt").read_text().endswith("iteration 1 ok\n \n \n \n")

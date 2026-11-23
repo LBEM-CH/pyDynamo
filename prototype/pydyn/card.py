@@ -3,9 +3,12 @@
 A line matches when it starts with the key followed directly by '='. The value runs up to the
 first ';'. The last matching line wins.
 """
+import re
 
 
-def read_card(path):
+def read_card(path, strip=True):
+    """key -> value text. strip=False: the text exactly as settings_card::extract_field returns it
+    (dynamo_compute_iteration_spp.cu:1871-1922: from after the '=' up to the first ';', not trimmed)."""
     fields = {}
     with open(path) as f:
         for line in f:
@@ -14,7 +17,8 @@ def read_card(path):
             key, _, rest = line.partition("=")
             if not key or key != key.strip() or key.startswith("%"):
                 continue
-            fields[key] = rest.split(";")[0].strip()
+            v = rest.rstrip("\n").split(";")[0]
+            fields[key] = v.strip() if strip else v
     return fields
 
 
@@ -24,6 +28,38 @@ def _num(fields, key, default=0.0):
         return float(v)
     except ValueError:
         return default
+
+
+# C atof (strtod, "C" locale): leading white space skipped, the longest numeric prefix converted (decimal, hex,
+# inf/infinity, nan), 0.0 when there is none
+_ATOF = re.compile(r"[ \t\n\v\f\r]*([+-]?(?:0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)(?:[pP][+-]?[0-9]+)?"
+                   r"|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?"
+                   r"|[nN][aA][nN]))")
+
+
+def atof(s):
+    m = _ATOF.match(s)
+    if not m:
+        return 0.0
+    t = m.group(1)
+    return float.fromhex(t) if "x" in t or "X" in t else float(t)
+
+
+def parse_area_search(v):
+    """area_search[3] as settings_card::settings_card reads it (dynamo_compute_iteration_spp.cu:1821-1852): the text
+    up to the first ' ' (the whole text without one); then, after that space and at most two more, the text up to
+    the next ' ' (an empty text gives 0); then the rest. So '4' gives [4, 4, 4], '4 2' gives [4, 2, 2], and a first
+    gap of 4 or more spaces (num2str of [4 4 2.5]: '4           4         2.5') gives [4, 0, 4]."""
+    i = v.find(" ")                                       # 1823 (npos as int: -1)
+    a0 = atof(v if i < 0 else v[:i])                      # 1827-1828 (substr(0, npos): the whole text)
+    rest = v[i + 1:]                                      # 1831 (npos + 1 = 0: the whole text)
+    for _ in range(2):                                    # 1834-1839
+        if rest[:1] == " ":
+            rest = rest[1:]
+    j = rest.find(" ")                                    # 1843
+    a1 = atof(rest if j < 0 else rest[:j])                # 1845-1847
+    a2 = atof(rest[j + 1:])                               # 1850-1852
+    return [a0, a1, a2]
 
 
 class Card:
@@ -51,7 +87,7 @@ class Card:
         self.low = _num(f, "low")
         self.use_CC = int(_num(f, "use_CC"))
         self.localnc = int(_num(f, "localnc", 1.0))
-        self.area_search = [float(x) for x in f.get("area_search", "0 0 0").split()][:3]
+        self.area_search = parse_area_search(read_card(path, strip=False).get("area_search", ""))
         self.area_search_modus = int(_num(f, "area_search_modus"))
         self.gpu_ids = [int(x) for x in f.get("gpu_identifier_set", "0").split()]
 

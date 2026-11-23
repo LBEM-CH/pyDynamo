@@ -66,6 +66,184 @@ def test_engine_mode_selection(monkeypatch):
         E.engine_mode("quick")
 
 
+def test_exact_batch_for_memory():
+    """The exact engine's batch is capped by the free GPU memory: buffers of 52 (68 without nopad) bytes per voxel and
+    orientation, plus 8 per voxel for each volume of the cufftPlanMany plans (B and the powers of two below B); at
+    least 1, never more than asked."""
+    assert X.BATCH_BYTES_PER_VOXEL == 52 and X.PAD_BYTES_PER_VOXEL == 16
+    assert X.batch_bytes(1, 64) == 0
+    assert X.batch_bytes(128, 1) == 52 * 128 + 8 * 255 and X.batch_bytes(65, 1) == 52 * 65 + 8 * (65 + 127)
+    assert X.batch_bytes(2, 1, nopad=False) == 68 * 2 + 8 * 3
+    assert all(X.batch_bytes(b, 32) < X.batch_bytes(b + 1, 32) for b in range(1, 200))
+    assert X.batch_for_memory(128, 64, 24e9) == 128                    # 2.3 GB at n = 64
+    budget = 24e9 * X.BATCH_MEMORY_SAFETY
+    b = X.batch_for_memory(128, 144, 24e9)                               # 26 GB for 128 orientations at n = 144
+    assert 1 < b < 128 and X.batch_bytes(b, 144) <= budget < X.batch_bytes(b + 1, 144)
+    assert X.batch_for_memory(128, 144, 24e9, nopad=False) < b
+    assert X.batch_for_memory(128, 512, 1e9) == 1 and X.batch_for_memory(7, 32, 1e12) == 7
+
+
+@pytest.mark.parametrize("n, field, value", [(33, None, None), (32, "localnc", 0), (32, "use_CC", 2)])
+def test_fast_engine_refuses_what_it_does_not_reproduce(n, field, value):
+    """Odd boxes (rawpeak2space and the spectrum folding differ for odd n), localnc 0 and use_CC 2: refused before
+    any GPU work, as the exact engine and the project set-up refuse them."""
+    card = _Card()
+    card.dim = card.sidelength = n
+    if field:
+        setattr(card, field, value)
+    t = np.zeros((n, n, n), np.float32)
+    with pytest.raises(NotImplementedError):
+        E.Engine(t, t, card, exact=False)
+    E.check_fast_supported(_Card(), 32)
+
+
+def _fast_card(modus=0, refine=0):
+    card = _Card()
+    card.cone_range, card.cone_sampling, card.cone_flip = 0.0, 0.0, 0
+    card.inplane_range, card.inplane_sampling, card.inplane_flip = 40.0, 20.0, 0     # 3 orientations per seed
+    card.area_search_modus, card.refine = modus, refine
+    return card
+
+
+def _stub_fast_engine(card, n=32, levels=None, shared=None):
+    """A fast Engine without GPU state: align_pairs returns levels[level](pidx) = (cc, space, neighbours) and records
+    the limit origins, align_shared returns `shared` (CPU tests of the host side of Engine._refine)."""
+    eng = E.Engine.__new__(E.Engine)
+    eng.card, eng.n, eng.powf, eng.timings, eng.origins = card, n, True, {}, []
+
+    def align_pairs(pidx, angles, origin, lim_matrix):
+        eng.origins.append(origin)
+        return levels[len(eng.origins) - 1](np.asarray(pidx))
+    eng.align_pairs = align_pairs
+    if shared is not None:
+        eng.shared_grid = True
+        eng.align_shared = lambda angles: shared
+    return eng
+
+
+def _scores(per_particle, n=32):
+    """cc of the k-th orientation of particle p = per_particle[p](k); peak at space (n/2+1, n/2-2, n/2+3) and equal
+    neighbours (subpixel 0), so the refined shift is (1, -2, 3)."""
+    def f(pidx):
+        cc = np.empty(len(pidx), np.float32)
+        for p in np.unique(pidx):
+            idx = np.flatnonzero(pidx == p)
+            cc[idx] = [per_particle[p](k) for k in range(len(idx))]
+        sp = np.tile(np.array([n // 2 + 1, n // 2 - 2, n // 2 + 3], np.int32), (len(pidx), 1))
+        return cc, sp, np.zeros((len(pidx), 6), np.float32)
+    return f
+
+
+def _no_peak_row(n=32):
+    return [-4001 - n / 2, -4002 - n / 2, -4003 - n / 2, -1001, -1002, -1003, -1]
+
+
+def test_fast_refine_takes_dynamo_best_orientation_or_its_defaults():
+    """Engine._refine as Dynamo (spp.cu:3961-3976, 4562, 4597-4614) and DynamoExact.refine_particle: a NaN orientation
+    does not compete, the first of equal maxima wins, and a level in which no orientation beats -1 writes Dynamo's
+    defaults (angles -1001/-1002/-1003, positions -4001/-4002/-4003, cc -1)."""
+    rows = np.zeros((3, 35), np.float32)
+    rows[:, 0] = [1, 2, 3]
+    rows[:, 3:6] = [0.5, -0.5, 0.25]                             # seeds (0, 0, 0): orientations narot 0, 20, -20
+    rows[:, 9] = 0.9
+    pats = [lambda k: [np.nan, 0.5, 0.5][k], lambda k: -1.0, lambda k: np.nan]
+    eng = _stub_fast_engine(_fast_card(), levels=[_scores(pats)])
+    out = eng._refine(rows)
+    oset = E.A.orientation_set((0.0, 0.0, 0.0), E.A.ScanRange(0.0, 0.0, 40.0, 20.0, 0, 0))
+    assert len(oset) == 3 and eng.orientation_counts == [9]
+    assert np.array_equal(out[0, 3:10], np.array([1, -2, 3, *oset[1], 0.5], np.float32))
+    for p in (1, 2):
+        assert np.array_equal(out[p, 3:10], np.array(_no_peak_row(), np.float32))
+    assert eng.origins == [None]                                  # modus 0: no limit
+
+
+def test_fast_refine_writes_the_last_level_even_without_a_peak():
+    """Every level writes its own result (Dynamo resets the best cc to -1 per align() call), so a last level in
+    which nothing beats -1 gives the defaults, not the previous level's row."""
+    rows = np.zeros((1, 35), np.float32)
+    eng = _stub_fast_engine(_fast_card(refine=1), levels=[_scores([lambda k: 0.5 - 0.1 * k]),
+                                                          _scores([lambda k: -1.0])])
+    out = eng._refine(rows)
+    assert len(eng.origins) == 2
+    assert np.array_equal(out[0, 3:10], np.array(_no_peak_row(), np.float32))
+
+
+@pytest.mark.parametrize("modus", [0, 7, 1, 4])
+def test_fast_refine_limit_origin_follows_dynamo_switch(modus):
+    """area_search_modus without a case in Dynamo's switch (spp.cu:4355-4413), e.g. 7, applies no limit."""
+    rows = np.zeros((2, 35), np.float32)
+    rows[:, 3:6] = [[0.6, -1.4, 2.0], [-0.2, 0.0, 3.7]]
+    eng = _stub_fast_engine(_fast_card(modus), levels=[_scores([lambda k: 0.5, lambda k: 0.5])])
+    eng._refine(rows)
+    (o,) = eng.origins
+    if modus in (0, 7):
+        assert o is None
+    elif modus == 1:
+        assert np.array_equal(o, np.full((2, 3), 16, np.float32))
+    else:
+        assert np.array_equal(o, np.trunc(np.float32(16) + rows[:, 3:6]).astype(np.float32))
+
+
+def test_fast_shared_grid_level_writes_dynamo_defaults_without_a_peak():
+    rows = np.zeros((2, 35), np.float32)
+    card = _fast_card()
+    shared = (np.array([-1, 0]), np.array([-1.0, 0.7], np.float32), np.array([[0, 0, 0], [17, 14, 19]]),
+              np.zeros((2, 6), np.float32))
+    eng = _stub_fast_engine(card, shared=shared)
+    out = eng._refine(rows)
+    common = E.A.orientation_set((0.0, 0.0, 0.0), E.A.ScanRange(0.0, 0.0, 40.0, 20.0, 0, 0))
+    assert np.array_equal(out[0, 3:10], np.array(_no_peak_row(), np.float32))
+    assert np.array_equal(out[1, 3:10], np.array([1, -2, 3, *common[0], 0.7], np.float32))
+    assert eng.origins == []
+
+
+class _FakePool:
+    peak = 0
+
+    def used_bytes(self):
+        return 0
+
+    def total_bytes(self):
+        return self.peak
+
+    def free_all_blocks(self):
+        pass
+
+
+def _fake_cupy(pool, free):
+    """The calls of MemoryBalancer into CuPy, without a GPU."""
+    from types import SimpleNamespace as NS
+    cache = NS(set_size=lambda k: None, clear=lambda: None)
+    return NS(fft=NS(config=NS(get_plan_cache=lambda: cache)), get_default_memory_pool=lambda: pool,
+              cuda=NS(Device=lambda: NS(synchronize=lambda: None), runtime=NS(memGetInfo=lambda: (free, 2 * free))))
+
+
+@pytest.mark.parametrize("fits, want", [(1000, 100), (12, 8), (5, 4), (1, 1), (0, None)])
+def test_memory_balancer_backs_off_when_a_probe_does_not_fit(monkeypatch, fits, want):
+    """calibrate halves probes that run out of memory (down to 1, which re-raises) and uses the smaller probe when
+    only the larger one does not fit; run_all then processes every item."""
+    from pydyn import balancer as Bm
+    pool = _FakePool()
+    monkeypatch.setattr(Bm, "cp", _fake_cupy(pool, free=10 ** 6))
+    monkeypatch.setattr(Bm, "OOM", (MemoryError,))
+    done = []
+
+    def run(b0, b1):
+        if b1 - b0 > fits:
+            raise MemoryError("probe does not fit")
+        pool.peak = 5000 + 1000 * (b1 - b0)
+        done.append((b0, b1))
+    bal = Bm.MemoryBalancer()
+    if want is None:
+        with pytest.raises(MemoryError):
+            bal.calibrate(run, 100)
+        return
+    assert bal.calibrate(run, 100) == want
+    done.clear()
+    bal.run_all(run, 100)
+    assert [d[0] for d in done] == list(range(0, 100, want)) and done[-1][1] == 100
+
+
 _EXTRA = re.compile(r"^(mov\.u32 %bzr0, %ctaid\.z|cvt\.u64\.u32 %bzd0, %bzr0|mad\.lo\.s64 %rd\d+, %bzd0, %bzd\d+, %rd\d+"
                     r"|cvta\.to\.global\.u64 %bzd\d+, %bzd\d+|shl\.b64 %bzd\d+, %bzd0, 2|add\.s64 %bzd\d+, %bzd\d+, %bzd\d+"
                     r"|ld\.global\.f32 %f\d+, \[%bzd\d+\]|ld\.param\.u64 %bzd\d+, \[\w+\]);$")
@@ -190,6 +368,45 @@ def test_exact_speed_options_and_their_fallbacks_give_the_same_table(opts, monke
     if opts == "":                                       # the default really runs the batched kernels (no fallback)
         ex = eng._ex
         assert ex.sync_level and ex.ops.reductions and ex.fuse and ex.nopad and ex.mats_level
+
+
+@pytest.mark.gpu
+@needs_dynamo
+def test_exact_batch_fits_the_gpu_memory_and_halves_on_out_of_memory(monkeypatch):
+    """The batch is cut to what the free GPU memory holds (batch_for_memory), and an allocation that fails in a batched
+    step halves it and computes the level again (_smaller_batch): both give the table of Dynamo's own
+    one-orientation loop (batch 1) bit for bit."""
+    monkeypatch.delenv("PYDYN_EXACT_OPTS", raising=False)
+    t, m, parts, rows = _case()
+    n = t.shape[0]
+    eng = E.Engine(t, m, _Card(), batch=1, exact=True)
+    eng.prepare_particles(parts, rows)
+    ref = eng.refine(rows)
+    eng.close()
+    free = (X.batch_bytes(5, n) + X.batch_bytes(6, n)) / 2 / X.BATCH_MEMORY_SAFETY     # holds 5, not 6
+    with monkeypatch.context() as mp:
+        mp.setattr(X, "_free_gpu_bytes", lambda: int(free))
+        eng = E.Engine(t, m, _Card(), batch=64, exact=True)
+    assert eng._ex.batch == 5 and eng._ex.nopad and "prr" not in eng._ex._buffers(5)
+    eng.prepare_particles(parts, rows)
+    out = eng.refine(rows)
+    eng.close()
+    assert np.array_equal(ref.view(np.int32), out.view(np.int32))
+    eng = E.Engine(t, m, _Card(), batch=64, exact=True)
+    ex = eng._ex
+    assert ex.batch == 64
+    alloc = ex._buffers
+
+    def tight(B):                                         # more than 4 volumes per step do not fit
+        if B > 4:
+            raise X.CufftAllocFailed("cufftPlanMany (cuFFT 8) failed: 2")
+        return alloc(B)
+    ex._buffers = tight
+    eng.prepare_particles(parts, rows)
+    out = eng.refine(rows)
+    eng.close()
+    assert ex.batch == 4
+    assert np.array_equal(ref.view(np.int32), out.view(np.int32))
 
 
 @pytest.mark.gpu

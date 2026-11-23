@@ -53,6 +53,52 @@ ENGINE_BINARY = os.path.join(DYNAMO_ROOT, "cuda", "bin", "dynamo_compute_iterati
 PTX_MD5 = "da35c4c571db739ad40cd0edd9703242"
 D2R = 0.0174532925199432954743716805978692718781530857086181640625      # spp.cu:3800 `const double degrees2rad`
 CUFFT_C2C, CUFFT_FORWARD, CUFFT_INVERSE = 0x29, -1, 1
+CUFFT_ALLOC_FAILED = 0x2                 # cufftResult (cufft.h): GPU memory for a plan could not be allocated
+
+
+class CufftAllocFailed(RuntimeError):
+    """cufftPlanMany returned CUFFT_ALLOC_FAILED: its work area does not fit in GPU memory (DynamoExact then retries
+    the refinement level with a smaller batch, _smaller_batch)."""
+
+
+# GPU memory of the batched path (batch B > 1), in bytes per voxel of the box: the [B, N] buffers of
+# DynamoExact._buffers, BATCH_BYTES_PER_VOXEL per orientation (complex64 rr, rm, RD, DMDM, D2M, float32 f_rr, f_rm,
+# f_ccf; PAD_BYTES_PER_VOXEL more for complex64 prr, prm, which are not allocated with nopad), and the work areas of
+# the cufftPlanMany plans of _fftb, which cuFFT 8 allocates outside CuPy's pool: plans for B volumes and for each
+# power of two below B, PLAN_BYTES_PER_VOXEL per volume (an allowance of one complex64 volume). An estimate: an
+# allocation that still fails halves the batch (DynamoExact._smaller_batch).
+BATCH_BYTES_PER_VOXEL = 5 * 8 + 3 * 4
+PAD_BYTES_PER_VOXEL = 2 * 8
+PLAN_BYTES_PER_VOXEL = 8
+BATCH_MEMORY_SAFETY = 0.90
+
+
+def batch_bytes(B, n, nopad=True):
+    """Estimated GPU memory of the batched path with B orientations per step (0 for B = 1: Dynamo's own loop on the
+    buffers allocated in DynamoExact.__init__)."""
+    B = int(B)
+    if B <= 1:
+        return 0
+    plan_volumes = B + (1 << (B - 1).bit_length()) - 1            # B, and the powers of two 1 .. < B
+    per_orientation = BATCH_BYTES_PER_VOXEL + (0 if nopad else PAD_BYTES_PER_VOXEL)
+    return (per_orientation * B + PLAN_BYTES_PER_VOXEL * plan_volumes) * int(n) ** 3
+
+
+def batch_for_memory(batch, n, free_bytes, nopad=True, safety=BATCH_MEMORY_SAFETY):
+    """The largest batch <= `batch` (at least 1) whose batch_bytes fit in safety x free_bytes. Any batch gives the
+    same bits (tests/test_exact.py), so this changes only the speed."""
+    b = max(1, int(batch))
+    while b > 1 and batch_bytes(b, n, nopad) > free_bytes * safety:
+        b -= 1
+    return b
+
+
+def _free_gpu_bytes():
+    """Free memory of the current device with CuPy's cached blocks released (what new buffers and plans can use)."""
+    cp.cuda.Device().synchronize()
+    cp.get_default_memory_pool().free_all_blocks()
+    return int(cp.cuda.runtime.memGetInfo()[0])
+
 
 # mangled names of the kernels in Dynamo's PTX (signatures as in spp.cu)
 KERNELS = {
@@ -394,6 +440,8 @@ class _Libs:
         dims = (ctypes.c_int * 3)(n, n, n)
         N = n ** 3
         r = self.cufft.cufftPlanMany(ctypes.byref(h), 3, dims, None, 1, N, None, 1, N, CUFFT_C2C, B)
+        if r == CUFFT_ALLOC_FAILED:
+            raise CufftAllocFailed(f"cufftPlanMany (cuFFT 8) failed: {r}")
         if r != 0:
             raise RuntimeError(f"cufftPlanMany (cuFFT 8) failed: {r}")
         return h.value
@@ -869,7 +917,8 @@ class DynamoExact:
       until the batch needs them on the host;
     * host scalars (mean = sum/nnz, sqrt, cc - 1, ...) as float32 NumPy array operations (IEEE, one rounding each).
     That each of these gives the bits of the per-orientation calls is checked by tests/test_exact.py and by the
-    harness (benchmarks/09_engine_parity/exact).
+    harness (benchmarks/09_engine_parity/exact). B is capped by the free GPU memory (batch_for_memory) and halved when
+    an allocation still fails (_smaller_batch); only the speed depends on it.
     """
 
     def __init__(self, template, mask, card, powf=True, batch=1, sdot_sms=None):
@@ -964,6 +1013,13 @@ class DynamoExact:
                     raise
                 _note(f"fused steps off on this GPU ({e}); Dynamo's kernels are used one by one")
                 self.fuse = False
+        # the batch the free GPU memory holds (batch_for_memory); an allocation that still fails in a batched step
+        # halves it (_smaller_batch). Any batch gives the same bits, batch 1 is Dynamo's own loop.
+        if self.batch > 1:
+            b = batch_for_memory(self.batch, n, _free_gpu_bytes(), self.nopad)
+            if b < self.batch:
+                _note(f"{b} orientations per step instead of {self.batch} (free GPU memory)")
+                self.batch = b
 
     def _validate_fuse(self, B=4):
         """fuse=1 against Dynamo's own kernels (normalize_fft, copy_cufft2float, copy_cufft2float_plus_one) and legacy
@@ -1142,11 +1198,24 @@ class DynamoExact:
             cp.get_default_memory_pool().free_all_blocks()
             c = lambda: cp.zeros((B, self.N), dtype=cp.complex64)
             f = lambda: cp.zeros((B, self.N), dtype=cp.float32)
-            self._bufs = dict(rr=c(), rm=c(), prr=c(), prm=c(), RD=c(), DMDM=c(), D2M=c(), f_rr=f(), f_rm=f(),
+            pad = {} if self.nopad else dict(prr=c(), prm=c())             # nopad: the FFTs run on rr, rm (__init__)
+            self._bufs = dict(rr=c(), rm=c(), RD=c(), DMDM=c(), D2M=c(), f_rr=f(), f_rm=f(),
                               f_ccf=f(), nnz=cp.zeros(B, cp.float32), ssum=cp.zeros(B, cp.float32),
-                              nrm=cp.zeros(B, cp.float32), pos=cp.zeros(B, cp.int32))
+                              nrm=cp.zeros(B, cp.float32), pos=cp.zeros(B, cp.int32), **pad)
             self._bB = B
         return self._bufs
+
+    def _smaller_batch(self, err):
+        """GPU memory ran out in a batched step: release the batch buffers and the cufftPlanMany plans and halve the
+        batch; the caller computes the refinement level again from its start. Any batch gives the same bits
+        (tests/test_exact.py); batch 1 is Dynamo's own loop on the buffers allocated in __init__."""
+        cp.cuda.Device().synchronize()
+        for p in self._plans_many.values():
+            self.L.cufft.cufftDestroy(p)
+        self._plans_many, self._bufs, self._bB = {}, None, 0
+        cp.get_default_memory_pool().free_all_blocks()
+        old, self.batch = self.batch, max(1, self.batch // 2)
+        _note(f"out of GPU memory with {old} orientations per step ({type(err).__name__}); {self.batch} from now on")
 
     def _fftb(self, a, B, direction):
         """In-place C2C of volumes a[0:B] (contiguous [B, N] complex64)."""
@@ -1256,7 +1325,7 @@ class DynamoExact:
         o1 = o0 + B
         kb = L.batched()
         bf = self._buffers(B)
-        rr, rm, prr, prm = bf["rr"], bf["rm"], bf["prr"], bf["prm"]
+        rr, rm, prr, prm = bf["rr"], bf["rm"], bf.get("prr"), bf.get("prm")    # no prr, prm with nopad
         RD, DMDM, D2M, f_rr, f_rm, f_ccf = bf["RD"], bf["DMDM"], bf["D2M"], bf["f_rr"], bf["f_rm"], bf["f_ccf"]
         g, blk = (n, n, B), (n,)
         C, R, Z, n32 = np.uint64(8 * N), np.uint64(4 * N), np.uint64(0), np.int32(n)
@@ -1345,6 +1414,41 @@ class DynamoExact:
             L.join()
         ops.peak7(f_ccf, pos, lv["vals"][7 * o0:7 * o1], lv["xyz"][3 * o0:3 * o1], B)   # 4441-4512
 
+    # -- spp.cu:4043-4588: the orientations of one refinement level
+    def _level(self, mats, ftype, wedge, origin, cc, sp, nb, _t):
+        """cc, sp, nb of every orientation of mats, filled in place; returns (info, _t). Nothing else is changed, so
+        the level can be computed again with a smaller batch (_smaller_batch)."""
+        O = len(mats)
+        info = []
+        if self.batch == 1:
+            for o in range(O):
+                cc[o], sp[o], nb[o], inf = self._orientation(mats[o], ftype, wedge, origin)
+                info.append(inf)
+        elif self.sync_level:
+            lv = self._level_buffers(O)
+            self.ops.err.fill(0)
+            d_all = cp.asarray(np.ascontiguousarray(mats, dtype=F).ravel()) if self.mats_level else None
+            for o0 in range(0, O, self.batch):
+                o1 = min(O, o0 + self.batch)
+                self._orientations_lv(mats[o0:o1], ftype, wedge, origin, lv, o0,
+                                      None if d_all is None else d_all[9 * o0:9 * o1])
+            _t = self._ht("queue", _t)
+            h = {k: lv[k][:(7 if k == "vals" else 3 if k == "xyz" else 1) * O].get() for k in lv}  # one wait
+            _t = self._ht("wait", _t)
+            if int(self.ops.err.get()[0]):
+                raise RuntimeError("cublasIsamax returned 0 (Dynamo aborts here, spp.cu:4425-4438)")
+            v = h["vals"].reshape(O, 7)
+            cc[:] = v[:, 0] - F(1)                                               # 4469
+            nb[:] = v[:, 1:] - F(1)                                              # 4520-4525
+            sp[:] = h["xyz"].reshape(O, 3)
+            info += list(zip(h["nnz"], h["ssum"], h["mean"], h["norm"]))
+        else:
+            for o0 in range(0, O, self.batch):
+                o1 = min(O, o0 + self.batch)
+                cc[o0:o1], sp[o0:o1], nb[o0:o1], inf = self._orientations(mats[o0:o1], ftype, wedge, origin)
+                info += list(zip(*inf))
+        return info, _t
+
     # -- spp.cu:2530-2610 + 3950-4615: all refinement levels of the loaded particle
     def refine_particle(self, row):
         card, n = self.card, self.n
@@ -1381,35 +1485,14 @@ class DynamoExact:
             cc = np.empty(O, dtype=F)
             sp = np.empty((O, 3), dtype=np.int64)
             nb = np.empty((O, 6), dtype=F)
-            info = []
-            if self.batch == 1:
-                for o in range(O):
-                    cc[o], sp[o], nb[o], inf = self._orientation(mats[o], ftype, wedge, origin)
-                    info.append(inf)
-            else:
-                if self.sync_level:
-                    lv = self._level_buffers(O)
-                    self.ops.err.fill(0)
-                    d_all = cp.asarray(np.ascontiguousarray(mats, dtype=F).ravel()) if self.mats_level else None
-                    for o0 in range(0, O, self.batch):
-                        o1 = min(O, o0 + self.batch)
-                        self._orientations_lv(mats[o0:o1], ftype, wedge, origin, lv, o0,
-                                              None if d_all is None else d_all[9 * o0:9 * o1])
-                    _t = self._ht("queue", _t)
-                    h = {k: lv[k][:(7 if k == "vals" else 3 if k == "xyz" else 1) * O].get() for k in lv}  # one wait
-                    _t = self._ht("wait", _t)
-                    if int(self.ops.err.get()[0]):
-                        raise RuntimeError("cublasIsamax returned 0 (Dynamo aborts here, spp.cu:4425-4438)")
-                    v = h["vals"].reshape(O, 7)
-                    cc[:] = v[:, 0] - F(1)                                       # 4469
-                    nb[:] = v[:, 1:] - F(1)                                      # 4520-4525
-                    sp[:] = h["xyz"].reshape(O, 3)
-                    info += list(zip(h["nnz"], h["ssum"], h["mean"], h["norm"]))
-                else:
-                    for o0 in range(0, O, self.batch):
-                        o1 = min(O, o0 + self.batch)
-                        cc[o0:o1], sp[o0:o1], nb[o0:o1], inf = self._orientations(mats[o0:o1], ftype, wedge, origin)
-                        info += list(zip(*inf))
+            while True:
+                try:
+                    info, _t = self._level(mats, ftype, wedge, origin, cc, sp, nb, _t)
+                    break
+                except (CufftAllocFailed, cp.cuda.memory.OutOfMemoryError) as e:
+                    if self.batch == 1:
+                        raise
+                    self._smaller_batch(e)                                      # then this level again
             if self.record is not None:
                 for o in range(O):
                     self.record.append((level, oset[o].copy(), mats[o].copy(), cc[o], tuple(int(x) for x in sp[o]),

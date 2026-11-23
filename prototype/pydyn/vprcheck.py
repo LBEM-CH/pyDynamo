@@ -27,8 +27,10 @@ def _read(f):
 
 
 def _size1(f, obj):
-    """size(object, 1): rows of a table, nx of a volume ([z, y, x] arrays)."""
-    if os.path.splitext(f)[1] in (".tbl", ".txt", ".rt"):
+    """size(object, 1): rows of a table (console.dread gives a .btbl as its [rows, cols] table), nx of a volume
+    ([z, y, x] arrays)."""
+    ext = os.path.splitext(f)[1]
+    if ext in (".tbl", ".txt", ".rt") or (ext == ".btbl" and np.ndim(obj) == 2):
         return obj.shape[0]
     return obj.shape[-1]
 
@@ -188,10 +190,10 @@ def check(vpr, verbosity=1):
         W.extend(w)
         E.extend(e)
 
-    nan = lambda x: isinstance(x, float) and np.isnan(x)     # comparisons with NaN are false in MATLAB
-    gt = lambda a, b: not (nan(a) or nan(b)) and a > b
-    ne = lambda a, b: not (nan(a) or nan(b)) and a != b
+    nan = lambda x: isinstance(x, float) and np.isnan(x)     # <, > with NaN are false in MATLAB; NaN ~= x is true,
+    gt = lambda a, b: not (nan(a) or nan(b)) and a > b       # as Python's != (checks 11, 12, 14, 22 use plain !=)
     lt = lambda a, b: not (nan(a) or nan(b)) and a < b
+    _d = dynio._matlab_d                                     # sprintf('%d', NaN) = 'NaN' (a size statistics left NaN)
     dest = vpr["destination"]
     ite_on = [r for r in range(1, 9) if float(vpr["ite_r%d" % r]) > 0]
 
@@ -279,12 +281,12 @@ def check(vpr, verbosity=1):
                 add([" particle dimension is not evenin round %d!!! Check \"dim_r%d\" parameter!" % (i, i)],
                     ["dim_r%d" % i])
     # 11-13 sizes
-    if ne(st["size_reference"], st["size_mask"]):
-        add(["Mask has size %d, reference has size %d. Please check " % (st["size_mask"], st["size_reference"])],
-            ["file_mask", "file_template_initial"])
-    if ne(st["size_reference"], st["size_smask"]):
-        add(["Smoothing FSC Mask has size %d, reference has size %d. Please check "
-             % (st["size_smask"], st["size_reference"])], ["file_mask_smoothing", "file_template_initial"])
+    if st["size_reference"] != st["size_mask"]:                  # dynamo_vpr_check.m:632
+        add(["Mask has size %s, reference has size %s. Please check "
+             % (_d(st["size_mask"]), _d(st["size_reference"]))], ["file_mask", "file_template_initial"])
+    if st["size_reference"] != st["size_smask"]:                 # :647
+        add(["Smoothing FSC Mask has size %s, reference has size %s. Please check "
+             % (_d(st["size_smask"]), _d(st["size_reference"]))], ["file_mask_smoothing", "file_template_initial"])
     if gt(st["size_reference"], sp):
         add(["reference has size %d, bigger than particle size %d. Please check " % (st["size_reference"], sp)],
             ["folder_data", "file_template_initial"])
@@ -293,9 +295,9 @@ def check(vpr, verbosity=1):
     for r_ in range(1, 9):
         if float(vpr["localnc_r%d" % r_]):
             continue
-        if ne(st["size_reference"], sp):
-            r14.append('reference size (%d) differs from particle size (%d). This is not allowed when "localnc" is '
-                       "set to zero (as in round %d). Please check. " % (st["size_reference"], sp, r_))
+        if st["size_reference"] != sp:                           # :697
+            r14.append('reference size (%s) differs from particle size (%s). This is not allowed when "localnc" is '
+                       "set to zero (as in round %d). Please check. " % (_d(st["size_reference"]), _d(sp), r_))
             e14 = ["folder_data", "file_template_initial"]
     add(r14, (), e14)
     # 15 check_template_is_not_flat (:1023-1104)  [runs before 16 in the call list]
@@ -348,9 +350,9 @@ def check(vpr, verbosity=1):
             if float(vpr["plugin_%s_r%d" % (kind, r_)]):
                 raise NotImplementedError("dvcheck of active plugins (plugin_%s_r%d)" % (kind, r_))
     # 22 check_size_fourier_count
-    if ne(st["size_fmask"], st["size_reference"]):
-        add(["fmask has size %d, reference has size %d. Please check " % (st["size_fmask"], st["size_reference"])],
-            (), ["folder_data", "file_fmask_initial"])
+    if st["size_fmask"] != st["size_reference"]:                 # :910
+        add(["fmask has size %s, reference has size %s. Please check "
+             % (_d(st["size_fmask"]), _d(st["size_reference"]))], (), ["folder_data", "file_fmask_initial"])
     # 23 check_reasonable_destination (:337-354)
     reasonable = ["matlab", "matlab_parfor", "matlab_gpu", "matlab_multicore", "standalone", "system_omp", "mpi",
                   "system_gpu", "mpi_gpu", "standalone_gpu"]

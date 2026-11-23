@@ -59,11 +59,30 @@ class MemoryBalancer:
         return pool.total_bytes() - resident
 
     def calibrate(self, run, n_items):
+        """Probe batches b1 < b2 and fit the batch to the free memory. A probe that runs out of memory backs off as
+        well: halved probes (down to 1, which re-raises), or batch = b1 when only the larger probe does not fit."""
         b1, b2 = (min(p, n_items) for p in self.probes)
         if n_items <= b1 or b1 == b2:
             self.batch = max(1, n_items)
             return self.batch
-        p1, p2 = self._peak(run, b1), self._peak(run, b2)
+        while True:
+            try:
+                p1 = self._peak(run, b1)
+                break
+            except OOM as e:
+                self._release()
+                if b1 == 1:
+                    raise
+                self.log.append({"event": "oom_backoff", "probe": b1, "error": type(e).__name__})
+                b1 = max(1, b1 // 2)
+                b2 = max(b1 + 1, b2 // 2)
+        try:
+            p2 = self._peak(run, b2)
+        except OOM as e:
+            self._release()
+            self.batch = b1
+            self.log.append({"event": "oom_backoff", "probe": b2, "error": type(e).__name__, "batch": b1})
+            return self.batch
         self.per_item = max(1.0, (p2 - p1) / (b2 - b1))
         self.fixed = max(0.0, p1 - self.per_item * b1)
         self._release()
